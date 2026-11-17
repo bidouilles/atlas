@@ -16,8 +16,8 @@ vaults, which open only in Obsidian (elsewhere they are plain text); links withi
 **Languages.** Memory, recall and history, search over Markdown notes and sources, discussions, the work
 queue, projects and multi-repo, and the hooks work whatever programming language a project uses, as does `.proto` indexing (rpc call
 sites are found in any language's files). The code index (`symbol`, item ranges on reads, grep annotations)
-covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java and Kotlin (through scip-go,
-scip-typescript, scip-dotnet, scip-python and scip-java when they are installed, or a prebuilt `index.scip`
+covers Rust, WGSL, `.proto`, Go, TypeScript, JavaScript, C#, Python, Java, Kotlin and Dart (through scip-go,
+scip-typescript, scip-dotnet, scip-python, scip-java and scip_dart when they are installed, or a prebuilt `index.scip`
 from CI, WSL or Docker, else an owned scanner), and any language with a SCIP indexer from a `.scip` file.
 Build and test digests recognise `cargo test`, `nextest`, `go test` (plain and `-json`), jest, vitest,
 `dotnet test`, pytest, Maven and Gradle output, and other runners get the generic digest.

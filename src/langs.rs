@@ -67,12 +67,9 @@ pub struct Lang {
     pub truth: &'static str,
     /// The SCIP indexer atlas runs for a unit, when one is found.
     pub driver: Option<Driver>,
-    /// The scanner also adds its definitions on lines of a file the index
-    /// covers where the index has none: code the indexer's build left out
-    /// (C#'s inactive `#if` branches, as Rust's line scan does for an
-    /// inactive `cfg`). Off where whole files are left out instead (Go's
-    /// build tags) and where the scanner's extra rows would be noise.
-    pub fills: bool,
+    /// Whether the scanner adds its definitions to a file the index covers,
+    /// where the index has none ([`Fill`]).
+    pub fills: Fill,
     /// For a row whose files are another row's units' ([`Lang::units_of`]):
     /// why that row's indexer is not run for a unit holding only this
     /// language's files (scip-java cannot read Kotlin 2). The unit is
@@ -87,6 +84,22 @@ pub struct Lang {
     /// How gRPC code generators write this language's stubs for a `.proto`
     /// service (see [`Grpc`]); `None`: no stubs are recognised.
     pub grpc: Option<Grpc>,
+}
+
+/// What the scanner adds to a file a SCIP index covers ([`Lang::fills`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    /// Nothing: whole files are left out instead (Go's build tags), or the
+    /// scanner's extra rows would be noise.
+    Off,
+    /// Its definitions on lines where the index has none: code the
+    /// indexer's build left out (C#'s inactive `#if` branches, as Rust's
+    /// line scan does for an inactive `cfg`).
+    Lines,
+    /// Its definitions of names the index has not defined on their line, on
+    /// any line: an indexer that keeps some declarations local (scip-dart: a
+    /// private enum whose values it defines on the same line).
+    Names,
 }
 
 /// A language's gRPC conventions: which files a generator writes and how
@@ -264,12 +277,18 @@ pub enum Does {
     /// Defines the `name` of every match on the line with this kind word,
     /// when another rule defined something on the line first (the members
     /// of an object type written inline in a declaration,
-    /// `type T = Merge<A, {x: X; y: Y}>`).
+    /// `type T = Merge<A, {x: X; y: Y}>`). A rule with a [`Rule::opens`]
+    /// kind applies only on a line whose definition declares a block of
+    /// that kind (the values of a Dart enum written on its line).
     Each(&'static str),
     /// Defines as [`Does::Def`] does, but the block it opens keeps the
     /// enclosing container: a Python method, whose `self.x` attributes and
     /// nested functions SCIP stores as its class's members.
     Member(&'static str),
+    /// Defines as [`Does::Def`] does, only when group `owner` is the
+    /// enclosing block's name: a Dart named constructor (`Point.origin(` in
+    /// class `Point`), not a call continuing a value (`List.of(`).
+    DefOf(&'static str),
 }
 
 /// The [`Rule::opens`] kind of a block that is no scope of its own: rules
@@ -416,7 +435,9 @@ pub struct Prereq {
     /// The JSON manifest that says whether it is needed.
     pub manifest: &'static str,
     /// Its keys that list what goes into the folder; the folder is needed
-    /// when one of them is a non-empty object.
+    /// when one of them is a non-empty object. Empty: the folder is needed
+    /// whenever the manifest exists (a pub package always resolves its SDK's
+    /// packages; the manifest need not be JSON).
     pub keys: &'static [&'static str],
     /// The command the note tells the user to run.
     pub fix: &'static str,
@@ -1446,6 +1467,333 @@ const KT_TRUTH: &str = concat!(
     r"\s+(?:<[^=(){}]*>\s*)?(?:[\w.?<>, *]+\.)?(?P<name>[A-Za-z_]\w*)"
 );
 
+const DART_QUOTES: &[Quote] = &[
+    Quote { open: "//", close: "", escape: false, multiline: false, template: "" },
+    Quote { open: "/*", close: "*/", escape: false, multiline: true, template: "" },
+    // Triple-quoted strings run across lines; every string may hold `${}`
+    // interpolations (a raw `r'...'` string is read as a plain one).
+    Quote { open: "'''", close: "'''", escape: true, multiline: true, template: "${" },
+    Quote { open: "\"\"\"", close: "\"\"\"", escape: true, multiline: true, template: "${" },
+    Quote { open: "'", close: "'", escape: true, multiline: false, template: "${" },
+    Quote { open: "\"", close: "\"", escape: true, multiline: false, template: "${" },
+];
+
+/// A Dart identifier.
+macro_rules! dart_id {
+    () => {
+        r"[A-Za-z_$][\w$]*"
+    };
+}
+
+/// Metadata before a Dart declaration (`@override`, `@JsonKey(name: 'x')`,
+/// one level of nested parentheses).
+macro_rules! dart_ann {
+    () => {
+        r"(?:@[\w$.]+(?:\s*\([^()]*(?:\([^()]*\)[^()]*)*\))?\s+)*"
+    };
+}
+
+/// Dart type arguments, nested up to three deep (`<String, List<Map<K,
+/// V>>>`); a function type or record inside them is read as text.
+macro_rules! dart_targs {
+    () => {
+        r"<(?:[\w$\s,.?&()\[\]@]|<(?:[\w$\s,.?&()\[\]@]|<[\w$\s,.?&()\[\]@]*>)*>)*>"
+    };
+}
+
+/// A Dart type: a dotted name with type arguments and `?`, or a record
+/// (`(int, String)`), then any `Function(...)` types it returns.
+macro_rules! dart_type {
+    () => {
+        concat!(
+            r"(?:[A-Za-z_$][\w$.]*(?:\s*",
+            dart_targs!(),
+            r")?\??|\([^()]*\)\??)(?:\s+Function\s*(?:",
+            dart_targs!(),
+            r")?\s*\([^()]*\)\??)*"
+        )
+    };
+}
+
+/// The start of a top-level declaration: at the left edge (top-level
+/// declarations are never indented; a deeper line continues an initializer).
+macro_rules! dart_top {
+    () => {
+        concat!(r"^", dart_ann!())
+    };
+}
+
+/// The start of a member declaration, with the modifiers a method may have.
+macro_rules! dart_member {
+    () => {
+        concat!(r"^\s*", dart_ann!(), r"(?:(?:static|external|abstract|augment)\s+)*")
+    };
+}
+
+/// What a variable's name may be followed by: a value, the end of the
+/// declaration, or another declarator.
+macro_rules! dart_var_end {
+    () => {
+        r"\s*(?:=[^=>]|=$|;|,\s*$)"
+    };
+}
+
+const DART_RULES: &[Rule] = &[
+    // Directives declare nothing (`library x;` is not a variable).
+    Rule { scope: "", re: r"^\s*(?:library|import|export|part)\b", does: Does::Open, opens: "" },
+    // Types. A file has no package clause: top-level definitions take the
+    // file's name as container, as scip-dart's symbols name the file.
+    Rule {
+        scope: "",
+        re: concat!(
+            r"^\s*",
+            dart_ann!(),
+            r"(?:(?:abstract|sealed|base|final|interface|mixin|augment)\s+)*class\s+(?P<name>",
+            dart_id!(),
+            ")"
+        ),
+        does: Does::Def("class"),
+        opens: "class",
+    },
+    Rule {
+        scope: "",
+        re: concat!(r"^\s*", dart_ann!(), r"(?:(?:base|augment)\s+)*mixin\s+(?P<name>", dart_id!(), ")"),
+        does: Does::Def("mixin"),
+        opens: "class",
+    },
+    Rule {
+        scope: "",
+        re: concat!(r"^\s*", dart_ann!(), r"(?:augment\s+)?enum\s+(?P<name>", dart_id!(), ")"),
+        does: Does::Def("enum"),
+        opens: "enum",
+    },
+    Rule {
+        scope: "",
+        re: concat!(r"^\s*", dart_ann!(), r"extension\s+type\s+(?:const\s+)?(?P<name>", dart_id!(), ")"),
+        does: Does::Def("class"),
+        opens: "class",
+    },
+    // A named extension; an unnamed one (`extension on X`) defines nothing
+    // (`on` is a keyword) and its members take the file's container.
+    Rule {
+        scope: "",
+        re: concat!(r"^\s*", dart_ann!(), r"extension\s+(?P<name>", dart_id!(), r")\b"),
+        does: Does::Def("extension"),
+        opens: "class",
+    },
+    Rule {
+        scope: "",
+        re: concat!(r"^\s*", dart_ann!(), r"typedef\s+(?P<name>", dart_id!(), r")\s*(?:", dart_targs!(), r"\s*)?(?:=|$)"),
+        does: Does::Def("type"),
+        opens: "",
+    },
+    Rule {
+        scope: "",
+        re: concat!(r"^\s*", dart_ann!(), r"typedef\s+(?:", dart_type!(), r"\s+)?(?P<name>", dart_id!(), r")\s*[(<]"),
+        does: Does::Def("type"),
+        opens: "",
+    },
+    // Top-level getters and setters, variables (before functions: a
+    // `void Function(int)` type is no function's name) and functions.
+    Rule {
+        scope: "",
+        re: concat!(dart_top!(), r"(?:external\s+)?(?:", dart_type!(), r"\s+)?(?:get|set)\s+(?P<name>", dart_id!(), r")\b"),
+        does: Does::Def("fn"),
+        opens: "",
+    },
+    Rule {
+        scope: "",
+        re: concat!(
+            dart_top!(),
+            r"(?:(?:external|late)\s+)*(?:(?:final|const|var)\s+(?:",
+            dart_type!(),
+            r"\s+)?|",
+            dart_type!(),
+            r"\s+)(?P<name>",
+            dart_id!(),
+            r"(?:\s*,\s*",
+            dart_id!(),
+            r")*)",
+            dart_var_end!()
+        ),
+        does: Does::Def("var"),
+        opens: "",
+    },
+    Rule {
+        scope: "",
+        re: concat!(
+            dart_top!(),
+            r"(?:external\s+)?(?:",
+            dart_type!(),
+            r"\s+)?(?P<name>",
+            dart_id!(),
+            r")\s*(?:",
+            dart_targs!(),
+            r")?\s*\("
+        ),
+        does: Does::Def("fn"),
+        opens: "",
+    },
+    // The values of an enum written on its line (`enum Mode { a, b }`).
+    Rule { scope: "", re: concat!(r"[{,]\s*(?P<name>", dart_id!(), r")\b"), does: Does::Each("variant"), opens: "enum" },
+    // A type's members. An unnamed constructor is stored under its type's
+    // name (the name must be the type's: a call continuing a value is none),
+    // a named one (`Point.origin(`, `factory Point.fromJson(`) under its own.
+    Rule {
+        scope: "class|enum",
+        re: concat!(r"^\s*", dart_ann!(), r"(?:(?:const|external|factory|augment)\s+)*(?P<name>", dart_id!(), r")\s*\("),
+        does: Does::DefOwner("ctor"),
+        opens: "",
+    },
+    Rule {
+        scope: "class|enum",
+        re: concat!(
+            r"^\s*",
+            dart_ann!(),
+            r"(?:(?:const|external|factory|augment)\s+)*(?P<owner>",
+            dart_id!(),
+            r")\.(?P<name>",
+            dart_id!(),
+            r")\s*\("
+        ),
+        does: Does::DefOf("ctor"),
+        opens: "",
+    },
+    // An enum's values, before its members: a name list, or one value with
+    // arguments (`red(0xff0000),`).
+    Rule {
+        scope: "enum",
+        re: concat!(
+            r"^\s*",
+            dart_ann!(),
+            r"(?P<name>",
+            dart_id!(),
+            r"(?:\s*,\s*",
+            dart_id!(),
+            r")*)\s*(?:",
+            dart_targs!(),
+            r"\s*)?(?:\(|,|;|$)"
+        ),
+        does: Does::Def("variant"),
+        opens: "",
+    },
+    Rule {
+        scope: "class|enum",
+        re: concat!(dart_member!(), r"(?:", dart_type!(), r"\s+)?(?:get|set)\s+(?P<name>", dart_id!(), r")\b"),
+        does: Does::Def("property"),
+        opens: "",
+    },
+    // Fields, before methods (a `void Function(int)?` field is no method):
+    // one or several declarators, a value or none.
+    Rule {
+        scope: "class|enum",
+        re: concat!(
+            r"^\s*",
+            dart_ann!(),
+            r"(?:(?:static|external|late|covariant|abstract|augment)\s+)*(?:(?:final|const|var)\s+(?:",
+            dart_type!(),
+            r"\s+)?|",
+            dart_type!(),
+            r"\s+)(?P<name>",
+            dart_id!(),
+            r"(?:\s*,\s*",
+            dart_id!(),
+            r")*)",
+            dart_var_end!()
+        ),
+        does: Does::Def("field"),
+        opens: "",
+    },
+    // A method has a return type (an untyped one is rare, and a line
+    // continuing a value looks the same).
+    Rule {
+        scope: "class|enum",
+        re: concat!(dart_member!(), dart_type!(), r"\s+(?P<name>", dart_id!(), r")\s*(?:", dart_targs!(), r")?\s*\("),
+        does: Does::Def("method"),
+        opens: "",
+    },
+    // A field line's further declarators (`final int a = 1, b = 2;`).
+    Rule { scope: "class|enum", re: concat!(r",\s*(?P<name>", dart_id!(), r")\s*=[^=]"), does: Does::Each("field"), opens: "" },
+];
+
+/// A line continuing a Dart declaration: an arrow body, a constructor's
+/// initializer list, a cascade or an operator carried to the next line.
+const DART_CONTINUED: &str = r"^\s*(?:=>|[:.?]|&&|\|\|)";
+
+/// Dart keywords and built-in words that are never a definition's name.
+const DART_KEYWORDS: &[&str] = &[
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "else",
+    "enum",
+    "extends",
+    "extension",
+    "factory",
+    "false",
+    "final",
+    "finally",
+    "for", "Function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "is",
+    "late",
+    "library",
+    "mixin",
+    "new",
+    "null",
+    "on",
+    "operator",
+    "part",
+    "required",
+    "rethrow",
+    "return",
+    "set",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "var",
+    "void",
+    "when",
+    "while",
+    "with",
+    "yield",
+];
+
+/// Build output, and CocoaPods' folder in a Flutter package's `ios/` and
+/// `macos/` (which holds no Dart).
+const DART_SKIP: &[&str] = &["build", "node_modules", "Pods"];
+
+/// The files whose change makes a Dart root stale: the pubspec and its lock
+/// (`pub get` writes the lock; `.dart_tool/`, a dot folder, is never walked).
+const DART_STALE: &[&str] = &["pubspec.yaml", "pubspec.lock", "pubspec_overrides.yaml"];
+
+/// The `--recall-check` truth for Dart: a type, named extension or typedef
+/// declaration, and a top-level function or variable at the left edge with
+/// a type (`void main(`, `Future<void> init(`, `String label =`). Members
+/// and untyped declarations are not counted.
+const DART_TRUTH: &str = concat!(
+    r"^(?P<kw>\s*(?:(?:abstract|sealed|base|final|interface|mixin|augment)\s+)*(?:class|mixin|enum|extension\s+type|extension|typedef)\s+",
+    r"|(?:void|Future<[^=(){}]*>|Stream<[^=(){}]*>|[A-Z][\w$]*(?:<[^=(){}]*>)?\??|int|double|bool|num|dynamic)(?:\s+Function\s*\([^()]*\)\??)?\s+)",
+    r"(?P<name>[A-Za-z_$][\w$]*)(?:\s*[(<{=;]|\s+(?:on|extends|with|implements)\b|\s*$)"
+);
+
 /// The languages, by row. See the module documentation.
 pub static LANGS: &[Lang] = &[
     Lang {
@@ -1468,7 +1816,7 @@ pub static LANGS: &[Lang] = &[
             once: &[],
         },
         truth: r"^(?P<kw>func|type|var|const)\b\s*(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_]\w*)",
-        fills: false,
+        fills: Fill::Off,
         unindexed: None,
         packages: Some(Packages { managers: &["gomod"], fold: Fold::Exact }),
         grpc: Some(Grpc {
@@ -1511,7 +1859,7 @@ pub static LANGS: &[Lang] = &[
             once: &[],
         },
         truth: TS_TRUTH,
-        fills: false,
+        fills: Fill::Off,
         unindexed: None,
         packages: Some(Packages { managers: &["npm"], fold: Fold::Exact }),
         grpc: Some(Grpc {
@@ -1573,7 +1921,7 @@ pub static LANGS: &[Lang] = &[
             once: &[],
         },
         truth: TS_TRUTH,
-        fills: false,
+        fills: Fill::Off,
         unindexed: None,
         packages: None,
         grpc: Some(Grpc {
@@ -1606,7 +1954,7 @@ pub static LANGS: &[Lang] = &[
             once: &[],
         },
         truth: CS_TRUTH,
-        fills: true,
+        fills: Fill::Lines,
         unindexed: None,
         packages: Some(Packages { managers: &["nuget"], fold: Fold::Exact }),
         grpc: Some(Grpc {
@@ -1655,7 +2003,7 @@ pub static LANGS: &[Lang] = &[
         truth: r"^\s*(?:async\s+)?(?P<kw>def|class)\s+(?P<name>[A-Za-z_]\w*)",
         // Overloads and property setters, which SCIP leaves without a
         // definition, are filled in from the scanner.
-        fills: true,
+        fills: Fill::Lines,
         unindexed: None,
         packages: Some(Packages { managers: &["python"], fold: Fold::Pep503 }),
         grpc: Some(Grpc {
@@ -1705,7 +2053,7 @@ pub static LANGS: &[Lang] = &[
         },
         truth: JAVA_TRUTH,
         // Members of anonymous classes, which SCIP keeps local.
-        fills: true,
+        fills: Fill::Lines,
         unindexed: None,
         packages: Some(Packages { managers: &["maven"], fold: Fold::Exact }),
         grpc: Some(Grpc {
@@ -1756,7 +2104,7 @@ pub static LANGS: &[Lang] = &[
             once: &[],
         },
         truth: KT_TRUTH,
-        fills: false,
+        fills: Fill::Off,
         unindexed: Some("scip-java reads Kotlin through semanticdb-kotlinc, which supports Kotlin 1.8 and 1.9 only"),
         packages: None,
         grpc: Some(Grpc {
@@ -1766,6 +2114,57 @@ pub static LANGS: &[Lang] = &[
             bases: &["{S}CoroutineImplBase"],
         }),
         driver: None,
+    },
+    Lang {
+        name: "dart",
+        exts: &["dart"],
+        skip_dirs: DART_SKIP,
+        // Every pub package is a unit, a package's `example/` app among them.
+        markers: &["pubspec.yaml"],
+        nested_units: true,
+        units_of: None,
+        stale: DART_STALE,
+        scanner: ScanRow {
+            quotes: DART_QUOTES,
+            rules: DART_RULES,
+            // scip-dart names a definition's file, not a package clause.
+            file_container: true,
+            continued_by: DART_CONTINUED,
+            header_continued: "",
+            // A class header the formatter wrapped (`class Impl<` then
+            // `    TRes> implements Base {`) opens its body on a deeper line.
+            allman: true,
+            not_names: DART_KEYWORDS,
+            indent: false,
+            once: &[],
+        },
+        truth: DART_TRUTH,
+        // scip_dart keeps private top-level declarations and some private
+        // members local (no global symbol), often on a line where it defines
+        // something else: the scanner fills them in by name.
+        fills: Fill::Names,
+        unindexed: None,
+        packages: Some(Packages { managers: &["pub"], fold: Fold::Exact }),
+        grpc: Some(Grpc { generated: &["*.pbgrpc.dart"], stubs: &["{rpc}"], servers: &["{rpc}"], bases: &["{S}ServiceBase"] }),
+        driver: Some(Driver {
+            tool: "scip_dart",
+            node_package: None,
+            // `dart pub global activate scip_dart` writes its launcher into
+            // the pub cache's `bin`.
+            find: &[Find::Path, Find::EnvJoin("PUB_CACHE", "bin"), Find::Home(".pub-cache/bin")],
+            version_arg: "--version",
+            // The launcher runs `dart pub global run`; scip-dart reads the
+            // unit's `.dart_tool/package_config.json`, written by `pub get`.
+            needs: &["dart"],
+            args: &["--output", "{out}", "."],
+            prereq: Some(Prereq { dir: ".dart_tool", manifest: "pubspec.yaml", keys: &[], fix: "dart pub get", required_by: None }),
+            projects: None,
+            env: &[],
+            fail_hint: None,
+            not_on_windows: Some(
+                "atlas does not find scip_dart's pub launcher (scip_dart.bat) on Windows: write the unit's index.scip with it, or name it in code.indexers",
+            ),
+        }),
     },
 ];
 
@@ -1978,12 +2377,16 @@ impl Driver {
 
 impl Prereq {
     /// Why a unit's folder cannot be indexed yet, if it cannot: its
-    /// manifest lists entries for [`Prereq::dir`] and the folder is absent.
+    /// manifest lists entries for [`Prereq::dir`] (or exists, when
+    /// [`Prereq::keys`] is empty) and the folder is absent.
     pub fn unmet(&self, unit: &Path) -> Option<String> {
         if unit.join(self.dir).is_dir() {
             return None;
         }
         let text = std::fs::read_to_string(unit.join(self.manifest)).ok()?;
+        if self.keys.is_empty() {
+            return Some(format!("no {}: run {}", self.dir, self.fix));
+        }
         let v = crate::json::parse(&text).ok()?;
         let needed = self.keys.iter().any(|k| v.get(*k).and_then(|x| x.as_object()).is_some_and(|o| !o.is_empty()));
         needed.then(|| format!("no {}: run {}", self.dir, self.fix))
@@ -2373,5 +2776,51 @@ mod tests {
         assert_eq!(truth("kotlin", "val TOP = 1").as_deref(), Some("TOP"));
         assert_eq!(truth("kotlin", "  private val cache = mutableMapOf<String, Int>()").as_deref(), Some("cache"));
         assert_eq!(truth("kotlin", "    val local = 1"), None, "a local looks like an unmodified member");
+    }
+
+    #[test]
+    fn dart_row_files_units_and_driver() {
+        let dart = by_name("dart").unwrap();
+        assert_eq!(of_path("lib/src/scan_screen.dart").map(|l| l.name), Some("dart"));
+        assert_eq!(dart.marker_rank("pubspec.yaml"), Some(0));
+        assert!(dart.nested_units, "a package's example app is a package of its own");
+        assert_eq!(of_stale_file("pubspec.lock").map(|l| l.name), Some("dart"));
+        assert!(dart.skips_path("build/app/x.dart") && dart.skips_path("ios/Pods/x.dart") && !dart.skips_path("lib/x.dart"));
+        assert!(is_generated("lib/src/generated/cart.pbgrpc.dart"));
+        assert_eq!(package_key("pub", "event_stacks_v3").as_deref(), Some("pub event_stacks_v3"));
+        let d = dart.driver.as_ref().unwrap();
+        let args: Vec<String> = d.args_for(Path::new("o.scip"), Some("pubspec.yaml"), "app").iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["--output", "o.scip", "."]);
+        // A pub package always resolves its SDK's packages: `.dart_tool` is
+        // needed whatever the pubspec lists.
+        let prereq = d.prereq.as_ref().unwrap();
+        let unit = std::env::temp_dir().join(format!("atlas-dart-prereq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&unit);
+        std::fs::create_dir_all(&unit).unwrap();
+        assert_eq!(prereq.unmet(&unit), None, "no pubspec.yaml: no pub package");
+        std::fs::write(unit.join("pubspec.yaml"), "name: app\n").unwrap();
+        assert_eq!(prereq.unmet(&unit).as_deref(), Some("no .dart_tool: run dart pub get"));
+        std::fs::create_dir(unit.join(".dart_tool")).unwrap();
+        assert_eq!(prereq.unmet(&unit), None);
+        let _ = std::fs::remove_dir_all(&unit);
+    }
+
+    #[test]
+    fn dart_truth_counts_declarations_not_members() {
+        let truth = |line: &str| {
+            let re = crate::regex::Regex::new(by_name("dart").unwrap().truth).unwrap();
+            re.captures(line).and_then(|c| c.name("name").map(|m| m.as_str().to_string()))
+        };
+        assert_eq!(truth("abstract base class Shape<T> extends Base {").as_deref(), Some("Shape"));
+        assert_eq!(truth("mixin Named on Object {").as_deref(), Some("Named"));
+        assert_eq!(truth("enum Mode { a, b }").as_deref(), Some("Mode"));
+        assert_eq!(truth("extension StringX on String {").as_deref(), Some("StringX"));
+        assert_eq!(truth("extension type UserId(int v) {}").as_deref(), Some("UserId"));
+        assert_eq!(truth("typedef Json = Map<String, dynamic>;").as_deref(), Some("Json"));
+        assert_eq!(truth("Future<void> main() async {").as_deref(), Some("main"));
+        assert_eq!(truth("String greet(String who) => who;").as_deref(), Some("greet"));
+        assert_eq!(truth("bool Function() trainingModeOf(Prefs p) =>").as_deref(), Some("trainingModeOf"));
+        assert_eq!(truth("extension on int {"), None, "an unnamed extension has no name");
+        assert_eq!(truth("  Widget build(BuildContext context) {"), None, "members are not counted");
     }
 }

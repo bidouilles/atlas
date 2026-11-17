@@ -1074,7 +1074,9 @@ fn namespace_name<'a>(name: &'a str, scheme: &str) -> &'a str {
     if scheme == "scip-python" {
         return last.rsplit('.').next().unwrap_or(last);
     }
-    for ext in [".d.ts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs", ".py", ".go", ".java", ".kt", ".cs", ".scala"] {
+    for ext in
+        [".d.ts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs", ".py", ".go", ".java", ".kt", ".cs", ".scala", ".dart"]
+    {
         if let Some(stem) = last.strip_suffix(ext).filter(|s| !s.is_empty()) {
             return stem;
         }
@@ -1229,7 +1231,15 @@ pub fn scip_rows_in(
     files: &mut HashMap<String, u32>,
     text_of: &dyn Fn(&str) -> Option<String>,
 ) {
-    let parsed: Vec<Option<Generic<'_>>> = ix.symbols.iter().map(|s| parse_generic(s)).collect();
+    // A type parameter is neither a definition nor a reference target, as
+    // the `[T]` descriptor already says for most indexers; scip-dart names
+    // one as a type of its file (`impl.dart/TRes#`) but gives its kind.
+    let parsed: Vec<Option<Generic<'_>>> = ix
+        .symbols
+        .iter()
+        .zip(&ix.info)
+        .map(|(s, info)| if info.kind == scip::KIND_TYPE_PARAMETER { None } else { parse_generic(s) })
+        .collect();
     let mut defined = vec![false; ix.symbols.len()];
     // The first definition occurrence of each symbol, for impl edges.
     let mut first_def: Vec<Option<usize>> = vec![None; ix.symbols.len()];
@@ -1852,37 +1862,49 @@ pub fn lang_rows(texts: &[(String, String)], rows: &mut Rows, files: &mut HashMa
 }
 
 /// Adds, for files of a row that fills ([`crate::langs::Lang::fills`]) and
-/// that a SCIP index covers, the scanner's definitions on lines where the
-/// index has no definition, marked `(scan)` as [`lang_rows`] marks them.
+/// that a SCIP index covers, the scanner's definitions the index does not
+/// have, marked `(scan)` as [`lang_rows`] marks them: on lines where it has
+/// none ([`crate::langs::Fill::Lines`]), or of names it has not defined on
+/// their line ([`crate::langs::Fill::Names`]).
 ///
 /// # Arguments
 ///
 /// * `texts` - the root's source files of the language table, by path.
 /// * `covered` - the paths an index has a document for.
 pub fn fill_rows(texts: &[(String, String)], covered: &HashSet<String>, rows: &mut Rows, files: &mut HashMap<String, u32>) {
-    let mut have: Option<HashSet<(u32, u32)>> = None;
+    use crate::langs::Fill;
+    let defs = || rows.occ.iter().filter(|o| o.sect == SECT_DEF);
+    let lines: HashSet<(u32, u32)> = defs().map(|o| (o.file, o.line)).collect();
+    let names: HashSet<(u32, u32, String)> = defs().map(|o| (o.file, o.line, o.name.clone())).collect();
+    let mut added = Vec::new();
     for (path, text) in texts {
-        let Some(lang) = crate::langs::of_path(path).filter(|l| l.fills && covered.contains(path)) else { continue };
-        let have = have.get_or_insert_with(|| rows.occ.iter().filter(|o| o.sect == SECT_DEF).map(|o| (o.file, o.line)).collect());
+        let Some(lang) = crate::langs::of_path(path).filter(|l| l.fills != Fill::Off && covered.contains(path)) else { continue };
         let file = rows.file(files, path, lang.name);
         for d in crate::scanner::of(lang).scan_file(path, text) {
-            if have.contains(&(file, d.line)) {
+            let known = match lang.fills {
+                Fill::Names => names.contains(&(file, d.line, d.name.clone())),
+                _ => lines.contains(&(file, d.line)),
+            };
+            if known {
                 continue;
             }
-            let e = rows.ends.entry((file, d.line)).or_insert(d.end);
-            *e = (*e).max(d.end);
-            rows.occ.push(Occ {
-                name: d.name,
-                sect: SECT_DEF,
-                file,
-                line: d.line,
-                col: d.col,
-                kind: format!("{} (scan)", d.kind),
-                container: d.container,
-                within: String::new(),
-            });
-            rows.stats.lang_defs += 1;
+            added.push((file, d));
         }
+    }
+    for (file, d) in added {
+        let e = rows.ends.entry((file, d.line)).or_insert(d.end);
+        *e = (*e).max(d.end);
+        rows.occ.push(Occ {
+            name: d.name,
+            sect: SECT_DEF,
+            file,
+            line: d.line,
+            col: d.col,
+            kind: format!("{} (scan)", d.kind),
+            container: d.container,
+            within: String::new(),
+        });
+        rows.stats.lang_defs += 1;
     }
 }
 
@@ -2679,6 +2701,33 @@ impl std::fmt::Display for WriteStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scanner fills in a name the index left out of a line it has: a
+    /// private Dart enum whose values scip-dart defines on the same line.
+    #[test]
+    fn fill_adds_names_the_index_left_out_of_a_line() {
+        let path = "lib/monitor.dart".to_string();
+        let mut rows = Rows::default();
+        let mut files = HashMap::new();
+        let file = rows.file(&mut files, &path, "dart");
+        for (name, col) in [("all", 22), ("checkedIn", 27)] {
+            rows.occ.push(Occ {
+                name: name.into(),
+                sect: SECT_DEF,
+                file,
+                line: 1,
+                col,
+                kind: "field".into(),
+                container: "_Filter".into(),
+                within: String::new(),
+            });
+        }
+        let texts = [(path.clone(), "enum _Filter { all, checkedIn }\n".to_string())];
+        fill_rows(&texts, &HashSet::from([path]), &mut rows, &mut files);
+        let mut defs: Vec<String> = rows.occ.iter().map(|o| format!("{} {}", o.kind, o.name)).collect();
+        defs.sort();
+        assert_eq!(defs, ["enum (scan) _Filter", "field all", "field checkedIn"]);
+    }
 
     #[test]
     fn item_lines() {

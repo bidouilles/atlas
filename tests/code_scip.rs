@@ -11,6 +11,7 @@
 //! | `ts` | scip-typescript 0.5.2 (Node 22) | packed (fields 1 and 7) | yes | yes |
 //! | `cs` | scip-dotnet 0.2.16, metadata `0.1.0-SNAPSHOT` (.NET SDK 8.0.427) | packed | none (all 0) | none |
 //! | `py` | scip-python 0.6.8 (its Docker image) | packed | none (all 0) | yes |
+//! | `dart` | scip_dart 1.6.2 (Dart 3.11.4) | packed | yes | none |
 //!
 //! To regenerate one, copy its folder somewhere outside any user path (the
 //! file records `project_root`) and run, in the copy, `scip-go --output
@@ -18,7 +19,8 @@
 //! `scip-dotnet index Shapes.csproj --output index.scip` (for `py`, in
 //! scip-python's Docker image, which does not run on Windows:
 //! `scip-python index . --project-name shapes --project-version 0.1.0
-//! --output index.scip`); then copy
+//! --output index.scip`; for `dart`, `dart pub get --offline` then
+//! `scip_dart --output index.scip .`); then copy
 //! `index.scip` back and update the versions here and in the tests.
 
 mod common;
@@ -150,6 +152,7 @@ fn fixture_indexes_decode_in_both_range_forms() {
         ("cs", ("scip-dotnet", "0.1.0-SNAPSHOT"), |n| n[1] == 0 && n[3] == 0 && n[0] > 0 && n[2] == 0),
         ("py", ("scip-python", "0.6.8"), |n| n[1] == 0 && n[3] == 0 && n[0] > 0 && n[2] > 0),
         ("java", ("scip-java", "HEAD-20260402-1750"), |n| n[1] == 0 && n[3] == 0 && n[0] > 0 && n[2] > 0),
+        ("dart", ("scip-dart", "1.6.2"), |n| n[1] == 0 && n[3] == 0 && n[0] > 0 && n[2] == 0),
     ] {
         let buf = fs::read(fixture_dir(lang).join("index.scip")).unwrap();
         let n = range_forms(&buf);

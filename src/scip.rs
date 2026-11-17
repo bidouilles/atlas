@@ -545,6 +545,9 @@ pub fn kind_word(kind: i32) -> Option<&'static str> {
     })
 }
 
+/// `SymbolInformation.Kind` of a type parameter (`scip.proto`).
+pub const KIND_TYPE_PARAMETER: i32 = 58;
+
 /// A short word for `SymbolInformation.Kind` in an index from any indexer
 /// but rust-analyzer (whose values [`kind_word`] keeps as they were): the
 /// words atlas prints for every language. `None` for 0 (the indexer gave

@@ -171,7 +171,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "symbol",
-        description: "Code symbol (Rust, WGSL, Protobuf, Go, TS/JS, C#, Python, Java; Kotlin and other files definitions only): definitions, references with their caller, impls.",
+        description: "Code symbol (Rust, WGSL, Protobuf, Go, TS/JS, C#, Python, Java, Dart; Kotlin and other files definitions only): definitions, references with their caller, impls.",
         read_only: true,
         schema: || obj(with_fmt(json!({"name": s("Name or Type::name."), "limit": n("References, default 10.")})), &["name"]),
     },

@@ -379,8 +379,11 @@ impl Scanner {
             // body taken from a line before already has its owner).
             let declared = opens.is_some();
             // In a row with header lines (Kotlin), any parameter list handing
-            // over to a body still to come (`) : Base,` then `Other {`).
-            let from_params = !declared && (line.trim_end().ends_with(')') || (self.header_continued.is_some() && closed_owner.is_some()));
+            // over to a body still to come (`) : Base,` then `Other {`); an
+            // arrow body on the next line (`String value) =>`) is one too.
+            let ends = line.trim_end();
+            let from_params =
+                !declared && (ends.ends_with(')') || ends.ends_with("=>") || (self.header_continued.is_some() && closed_owner.is_some()));
             let what = opens.or_else(|| closed_owner.map(|(o, kind, container)| (kind, container, Some(o))));
             // A header line's parameter list closed on it hands over to a
             // body it opens (`private constructor(x: X) {`).
@@ -600,7 +603,11 @@ impl Scanner {
                     out.push(Def { name: outer.clone(), kind, container: outer.clone(), line: n, col: at as u32, end: n });
                     opens = Some((rule.opens, outer.clone(), Some(out.len() - 1)));
                 }
-                Does::Def(kind) | Does::Member(kind) => {
+                Does::Def(kind) | Does::Member(kind) | Does::DefOf(kind) => {
+                    // A named constructor's prefix must be its type's name.
+                    if matches!(rule.does, Does::DefOf(_)) && c.name("owner").is_none_or(|m| m.as_str() != outer) {
+                        continue;
+                    }
                     let container = c.name("container").map(|m| m.as_str().to_string()).unwrap_or_else(|| outer.clone());
                     let first = out.len();
                     if let Some(m) = c.name("name") {
@@ -644,16 +651,24 @@ impl Scanner {
             Some((kind, named, Some(_))) if !kind.is_empty() => named.clone(),
             _ => outer.clone(),
         };
-        for (rule, _, re) in
-            self.rules.iter().filter(|(r, scopes, _)| defined && matches!(r.does, Does::Each(_)) && scopes.contains(&scope))
-        {
+        // An `Each` rule naming a block kind applies only on a line that
+        // declares a block of that kind (a Dart enum written on one line).
+        let declared = opens.as_ref().map_or("", |o| o.0);
+        for (rule, _, re) in self.rules.iter().filter(|(r, scopes, _)| {
+            defined && matches!(r.does, Does::Each(_)) && scopes.contains(&scope) && (r.opens.is_empty() || r.opens == declared)
+        }) {
             let Does::Each(kind) = rule.does else { continue };
-            for c in re.captures_iter(line) {
+            // A rule for a block's members reads the line from the block's
+            // brace on (`enum Mode with A, B { a, b }`: not `B`).
+            let from = if rule.opens.is_empty() { Some(0) } else { line.find('{') };
+            let Some(from) = from else { continue };
+            for c in re.captures_iter(&line[from..]) {
                 let Some(m) = c.name("name") else { continue };
                 if self.not_names.contains(&m.as_str()) || out.iter().rev().take_while(|d| d.line == n).any(|d| d.name == m.as_str()) {
                     continue;
                 }
-                out.push(Def { name: m.as_str().to_string(), kind, container: each_in.clone(), line: n, col: m.start() as u32, end: n });
+                let col = (from + m.start()) as u32;
+                out.push(Def { name: m.as_str().to_string(), kind, container: each_in.clone(), line: n, col, end: n });
             }
         }
         opens
@@ -1353,6 +1368,251 @@ typealias Shapes = List<Shape>
                 "method visitor.visit 50-50",
                 "fn shapes.second 54-54",
                 "type shapes.Shapes 56-56",
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod dart_tests {
+    use super::of;
+
+    fn labels(path: &str, text: &str) -> Vec<String> {
+        of(crate::langs::by_name("dart").unwrap())
+            .scan_file(path, text)
+            .iter()
+            .map(|d| format!("{} {}.{} {}-{}", d.kind, d.container, d.name, d.line, d.end))
+            .collect()
+    }
+
+
+    /// Lines continuing a declaration are not declarations: arrow bodies (also
+    /// after a wrapped parameter list), and the name of a field whose
+    /// function type fills the line before.
+    #[test]
+    fn dart_calls_on_continuation_lines_are_no_constructors() {
+        let src = r#"class TokenStorage {
+  TokenStorage._internal();
+
+  Future<void> write(String key, String value) =>
+      _storage.write(key: key, value: value);
+
+  bool get isTablet =>
+      MediaQuery.of(context).size.shortestSide >= 600;
+}
+
+enum Agg {
+  avg,
+  $unknown;
+
+  factory Agg.fromJson(
+          String value) =>
+      fromJson$Agg(value);
+}
+
+class Hooks {
+  static Future<String?> Function(String code, {required bool badge})?
+      onPrint;
+}
+"#;
+        assert_eq!(
+            labels("lib/auth/token_storage.dart", src),
+            [
+                "class token_storage.TokenStorage 1-9",
+                "ctor TokenStorage._internal 2-2",
+                "method TokenStorage.write 4-5",
+                "property TokenStorage.isTablet 7-8",
+                "enum token_storage.Agg 11-18",
+                "variant Agg.avg 12-12",
+                "variant Agg.$unknown 13-13",
+                "ctor Agg.fromJson 15-17",
+                "class token_storage.Hooks 20-23",
+            ]
+        );
+    }
+
+    /// Directives, interpolated strings holding braces, class modifiers,
+    /// constructors (unnamed, named, factory, const with a multi-line
+    /// parameter list, an initializer list on the next line), getters and
+    /// setters, arrow bodies, enhanced enums, mixins, extensions (named and
+    /// unnamed), extension types, typedefs, top-level functions and
+    /// variables, and a multi-line value at the top level.
+    /// A one-line enum's values are read from its brace on: neither the
+    /// types it implements or mixes in nor its type parameters.
+    #[test]
+    fn dart_one_line_enum_values_after_the_brace() {
+        let src = "enum Mode implements Comparable<Mode>, Named { a, b }\nenum Kind with A, B { c }\nenum Pair<K, V> { d }\n";
+        assert_eq!(
+            labels("lib/modes.dart", src),
+            [
+                "enum modes.Mode 1-1",
+                "variant Mode.a 1-1",
+                "variant Mode.b 1-1",
+                "enum modes.Kind 2-2",
+                "variant Kind.c 2-2",
+                "enum modes.Pair 3-3",
+                "variant Pair.d 3-3",
+            ]
+        );
+    }
+
+    /// Directives, interpolated strings holding braces, class modifiers,
+    /// constructors (unnamed, named, factory, const with a multi-line
+    /// parameter list, an initializer list on the next line), getters and
+    /// setters, arrow bodies, enhanced enums, mixins, extensions (named and
+    /// unnamed), extension types, typedefs, top-level functions and
+    /// variables, and a multi-line value at the top level.
+    #[test]
+    fn dart_declarations_members_and_enums() {
+        let src = r#"library shapes;
+
+import 'package:flutter/widgets.dart';
+part 'shapes.g.dart';
+
+const double unit = 1.0;
+final _log = Logger('shapes');
+late String label;
+Map<String, int> counts = {};
+
+typedef Builder = Widget Function(BuildContext context);
+typedef void Callback(int x);
+
+/// A shape.
+@immutable
+abstract base class Shape<T extends num> extends Base with Named implements Comparable<Shape<T>> {
+  static const int sides = 0;
+  final String name, tag;
+  late final double _area = 0;
+  int? count;
+  void Function(int)? onTap;
+
+  const Shape(this.name, this.tag);
+
+  Shape.square(double side)
+      : name = 'sq',
+        tag = '{';
+
+  factory Shape.fromJson(Map<String, dynamic> json) => Circle(json['r'] as double);
+
+  double get area => _area;
+  set area(double v) {}
+
+  @override
+  int compareTo(Shape<T> other) {
+    final local = '${name} and ${tag.isEmpty ? "}" : "x"}';
+    return local.length;
+  }
+
+  static Future<List<Shape>> loadAll({required String path}) async {
+    return [];
+  }
+}
+
+class Circle extends StatelessWidget {
+  const Circle({
+    super.key,
+    required this.radius,
+  });
+
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) => SizedBox(width: radius);
+}
+
+enum Color {
+  red(0xff0000),
+  green(0x00ff00),
+  blue(0x0000ff);
+
+  const Color(this.rgb);
+  final int rgb;
+
+  String hex() => rgb.toRadixString(16);
+}
+
+enum Simple { a, b, c }
+
+mixin Named on Object {
+  String get title => '';
+}
+
+extension StringX on String {
+  bool get isBlank => trim().isEmpty;
+}
+
+extension on int {
+  int twice() => this * 2;
+}
+
+extension type UserId(int value) implements int {}
+
+sealed class Result {}
+
+Future<void> main() async {
+  runApp(const Circle(radius: 1));
+}
+
+String greet(String who) => 'hi $who';
+
+final router = GoRouter(
+  routes: [
+    route(path: '/'),
+  ],
+);
+
+typedef LongName
+    = Map<String, int>;
+"#;
+        assert_eq!(
+            labels("lib/src/shapes.dart", src),
+            [
+                "var shapes.unit 6-6",
+                "var shapes._log 7-7",
+                "var shapes.label 8-8",
+                "var shapes.counts 9-9",
+                "type shapes.Builder 11-11",
+                "type shapes.Callback 12-12",
+                "class shapes.Shape 16-43",
+                "field Shape.sides 17-17",
+                "field Shape.name 18-18",
+                "field Shape.tag 18-18",
+                "field Shape._area 19-19",
+                "field Shape.count 20-20",
+                "field Shape.onTap 21-21",
+                "ctor Shape.Shape 23-23",
+                "ctor Shape.square 25-27",
+                "ctor Shape.fromJson 29-29",
+                "property Shape.area 31-31",
+                "property Shape.area 32-32",
+                "method Shape.compareTo 35-38",
+                "method Shape.loadAll 40-42",
+                "class shapes.Circle 45-55",
+                "ctor Circle.Circle 46-49",
+                "field Circle.radius 51-51",
+                "method Circle.build 54-54",
+                "enum shapes.Color 57-66",
+                "variant Color.red 58-58",
+                "variant Color.green 59-59",
+                "variant Color.blue 60-60",
+                "ctor Color.Color 62-62",
+                "field Color.rgb 63-63",
+                "method Color.hex 65-65",
+                "enum shapes.Simple 68-68",
+                "variant Simple.a 68-68",
+                "variant Simple.b 68-68",
+                "variant Simple.c 68-68",
+                "mixin shapes.Named 70-72",
+                "property Named.title 71-71",
+                "extension shapes.StringX 74-76",
+                "property StringX.isBlank 75-75",
+                "method shapes.twice 79-79",
+                "class shapes.UserId 82-82",
+                "class shapes.Result 84-84",
+                "fn shapes.main 86-88",
+                "fn shapes.greet 90-90",
+                "var shapes.router 92-96",
+                "type shapes.LongName 98-99",
             ]
         );
     }
