@@ -218,10 +218,29 @@ fn next_word(s: &str) -> Option<(&str, &str)> {
 /// `time`, `xargs` or `!` is caught, and a quoted word is checked as a
 /// command of its own (`bash -c "git push"`). A quoted value stays one
 /// word, so `-C "a log"` cannot pass for a subcommand.
-fn piece_writes(mut rest: &str) -> bool {
+///
+/// Every nested call is on a strictly shorter text, so it ends. A word can
+/// come back as the whole piece with its space still inside (a quote opened
+/// mid-word as in `--format="%h %s"`, one left open by the cut at `|`, an
+/// escaped space): scanning it again would return it again, without end. It
+/// is read once more with its quotes and backslashes dropped instead.
+fn piece_writes(piece: &str) -> bool {
+    let mut rest = piece;
     while let Some((w, r)) = next_word(rest) {
         rest = r;
-        if (w.contains(char::is_whitespace) && piece_writes(w)) || (command_word(w).eq_ignore_ascii_case("git") && !git_reads(r)) {
+        if command_word(w).eq_ignore_ascii_case("git") && !git_reads(r) {
+            return true;
+        }
+        if !w.contains(char::is_whitespace) {
+            continue;
+        }
+        let nested = if w.len() < piece.len() {
+            piece_writes(w)
+        } else {
+            let bare: String = w.chars().filter(|c| !matches!(c, '"' | '\'' | '\\')).collect();
+            bare.len() < w.len() && piece_writes(&bare)
+        };
+        if nested {
             return true;
         }
     }
@@ -1456,6 +1475,41 @@ mod tests {
 
     fn it(name: &str, kind: &str, line: u32, end: u32) -> Item {
         Item { name: name.into(), kind: kind.into(), line, end }
+    }
+
+    #[test]
+    fn a_word_the_scanner_cannot_split_does_not_recurse_forever() {
+        // Each of these holds a word with a space that `next_word` hands
+        // back whole (a quote opened mid-word, one left open by the cut at
+        // `|`, an escaped space). `piece_writes` used to call itself on
+        // that same word until the hooks thread overflowed its stack and
+        // the server aborted.
+        for cmd in [r#"git log --format="%h %s""#, r#"grep -n "mod tests\|fn git_" src/a.rs"#, r"ls a\ b", r#"grep x a"b c"d"#] {
+            assert!(routable(cmd), "{cmd}");
+        }
+        // The quoted command is still read once the quotes are dropped.
+        assert!(!routable(r#"ls; sh -c x="y" "git push""#));
+        assert!(!routable(r#"ls | xargs -I{} sh -c 'a\ b; git push'"#));
+        assert!(piece_writes(r#"x=" git push"#));
+    }
+
+    #[test]
+    fn piece_writes_returns_on_every_mix_of_quotes_escapes_and_spaces() {
+        // Every text of up to eight of these characters, then long runs of
+        // the forms that nest: the scan returns and its depth stays far
+        // from the stack's end.
+        let alphabet = ['a', ' ', '"', '\'', '\\'];
+        let mut texts = vec![String::new()];
+        for _ in 0..8 {
+            let longer: Vec<String> = texts.iter().flat_map(|t| alphabet.iter().map(move |c| format!("{t}{c}"))).collect();
+            for t in &longer {
+                assert!(!piece_writes(t), "{t:?}");
+            }
+            texts = longer;
+        }
+        for unit in ["\"a 'a ", "'a \"a ", "a\\ ", "a\"a a", "\\\" a ", "\"'\\ "] {
+            assert!(!piece_writes(&unit.repeat(50_000)), "{unit:?}");
+        }
     }
 
     #[test]
