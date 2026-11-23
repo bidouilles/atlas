@@ -17,7 +17,7 @@
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
@@ -165,18 +165,26 @@ pub enum Parsed {
 ///
 /// A message for a body that is not JSON or lacks a field the event needs.
 pub fn parse(event: &str, body: &[u8]) -> std::result::Result<Parsed, String> {
+    parse_ignoring(event, body, &Ignore::default())
+}
+
+/// [`parse`], with the reviews and comments `ignore` names ([`Ignore`])
+/// ignored too.
+///
+/// # Errors
+///
+/// As [`parse`].
+pub fn parse_ignoring(event: &str, body: &[u8], ignore: &Ignore) -> std::result::Result<Parsed, String> {
     let text = std::str::from_utf8(body).map_err(|_| "the body is not UTF-8".to_string())?;
     let v = crate::json::parse(text).map_err(|e| format!("the body is not JSON: {e}"))?;
     let s = |p: &str| v.pointer(p).and_then(Value::as_str).unwrap_or("").to_string();
     let action = s("/action");
     let action = match (event, action.as_str()) {
-        // L1: a review by the PR's own author, or by a bot, is no review.
+        // L1: a review by the PR's own author is no review.
         ("pull_request_review", "submitted")
-            if !s("/review/user/login").is_empty()
-                && (s("/review/user/login").eq_ignore_ascii_case(&s("/pull_request/user/login"))
-                    || s("/review/user/login").ends_with("[bot]")) =>
+            if !s("/review/user/login").is_empty() && s("/review/user/login").eq_ignore_ascii_case(&s("/pull_request/user/login")) =>
         {
-            return Ok(Parsed::Ignored("a review by the PR's author or by a bot"))
+            return Ok(Parsed::Ignored("a review by the PR's author"))
         }
         ("pull_request_review", "submitted") => Action::Reviewed,
         ("pull_request_review_comment", "created") => Action::ReviewComment,
@@ -190,6 +198,27 @@ pub fn parse(event: &str, body: &[u8]) -> std::result::Result<Parsed, String> {
         }
         _ => return Ok(Parsed::Ignored("an event that does not count")),
     };
+    // #385, #390: what a bot or an ignored login says is not heard, nor what
+    // the gh user comments; the gh user's own review still counts. Copilot's
+    // login carries no `[bot]` suffix; its type says Bot.
+    let user = match action {
+        Action::Reviewed => Some("/review/user"),
+        Action::ReviewComment | Action::Comment => Some("/comment/user"),
+        Action::Merged | Action::Closed => None,
+    };
+    if let Some(user) = user {
+        let login = s(&format!("{user}/login"));
+        let bot = |t: String| t.eq_ignore_ascii_case("bot");
+        if bot(s(&format!("{user}/type"))) || bot(s("/sender/type")) || login.to_ascii_lowercase().ends_with("[bot]") {
+            return Ok(Parsed::Ignored("a review or comment by a bot"));
+        }
+        if action == Action::Reviewed && ignore.review(&login) {
+            return Ok(Parsed::Ignored("a review by an ignored login"));
+        }
+        if action != Action::Reviewed && ignore.comment(&login) {
+            return Ok(Parsed::Ignored("a comment by the gh user or an ignored login"));
+        }
+    }
     let repo = s("/repository/full_name");
     if repo.is_empty() {
         return Err("no repository.full_name".into());
@@ -229,6 +258,75 @@ pub struct Ctx {
     pub lane: String,
     /// Where proofs of hook ownership go, for the supervisor (H1).
     pub proofs: pr_supervise::Proofs,
+    /// The logins whose comments, and for some reviews, file nothing.
+    pub ignore: Ignore,
+}
+
+/// The logins whose events file nothing (#385), compared without case, as
+/// GitHub does: the authenticated gh user ([`gh_user`], read once at start),
+/// whose PR comments and review comments are ignored but whose reviews still
+/// meet waits (that user is also the person reviewing), and
+/// `pr_events.ignore_logins`, whose reviews are ignored too.
+#[derive(Debug, Clone, Default)]
+pub struct Ignore {
+    me: Vec<String>,
+    logins: Vec<String>,
+}
+
+impl Ignore {
+    /// The gh user, one per host served when known, and the configured
+    /// logins.
+    pub fn new(gh_users: &[String], logins: &[String]) -> Ignore {
+        Ignore { me: gh_users.to_vec(), logins: logins.to_vec() }
+    }
+
+    /// Whether a review by `login` is ignored: a configured login only.
+    pub fn review(&self, login: &str) -> bool {
+        any_is(&self.logins, login)
+    }
+
+    /// Whether a review comment or PR comment by `login` is ignored: the gh
+    /// user or a configured login.
+    pub fn comment(&self, login: &str) -> bool {
+        any_is(&self.me, login) || any_is(&self.logins, login)
+    }
+}
+
+fn any_is(logins: &[String], login: &str) -> bool {
+    !login.is_empty() && logins.iter().any(|l| l.eq_ignore_ascii_case(login))
+}
+
+/// Whether `s` reads as a GitHub login: 1 to 39 of `A-Z a-z 0-9 - _` (`_`
+/// for an Enterprise Managed User, `jdoe_acme`), or a bot's with its
+/// `[bot]` suffix.
+fn is_login(s: &str) -> bool {
+    let base = s.strip_suffix("[bot]").unwrap_or(s);
+    (1..=39).contains(&base.len()) && base.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The login of the user gh is authenticated as on `host` (`gh api user`,
+/// with `--hostname` for a host other than github.com), read once when the
+/// listener starts.
+///
+/// # Errors
+///
+/// A message when gh is missing, not logged in, or answers no login.
+pub fn gh_user(gh: &dyn pr_supervise::Gh, host: Option<&str>) -> std::result::Result<String, String> {
+    let mut args = vec!["api".to_string()];
+    if let Some(h) = host {
+        args.extend(["--hostname".to_string(), h.to_string()]);
+    }
+    args.extend(["user", "--jq", ".login"].map(String::from));
+    let out = gh.run(&args).map_err(|e| format!("gh api user: {e}"))?;
+    if !out.status.success() {
+        return Err("gh api user failed (is gh logged in? `gh auth status`)".into());
+    }
+    let login = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if is_login(&login) {
+        Ok(login)
+    } else {
+        Err("gh api user answered no login".into())
+    }
 }
 
 /// One HTTP request as read.
@@ -370,7 +468,7 @@ pub fn handle(store: &mut MemoryStore, ctx: &Ctx, req: &Request) -> Outcome {
     if let Some((repo, id)) = proof(&ctx.secrets, event, &req.body, header, req.header("x-github-hook-id")) {
         ctx.proofs.add(&repo, id);
     }
-    let ev = match parse(event, &req.body) {
+    let ev = match parse_ignoring(event, &req.body, &ctx.ignore) {
         Ok(Parsed::Event(ev)) => ev,
         Ok(Parsed::Ignored(why)) => return outcome(204, format!("ignored: {why}")),
         Err(e) => return outcome(400, e),
@@ -416,7 +514,9 @@ fn reason(status: u16) -> &'static str {
 pub type Shared<'a> = Mutex<&'a mut MemoryStore>;
 
 /// Serves one connection: reads the request, answers, and returns what it
-/// did. The store is held only while the request is handled.
+/// did. The store is held only while the request is handled. After the
+/// answer the server ends its side and drains what the client still sends
+/// for up to [`LINGER`] (500 ms), so an early answer is not lost to a reset.
 ///
 /// The connection is read through a borrow, never a `try_clone`: on Windows
 /// the cloned socket handle is inheritable, so a process started meanwhile
@@ -433,8 +533,9 @@ pub fn serve_conn(stream: TcpStream, store: &Shared<'_>, ctx: &Ctx) -> io::Resul
 /// [`serve_conn`] with the request's whole read bounded by `limit` (M1):
 /// a client that trickles its request is answered 408 once it runs out.
 /// One connection at a time stays: with the deadline, one slow peer holds
-/// the listener for `limit` at most, and the forwarder retries a refused
-/// post.
+/// the listener for `limit` plus the answer's drain ([`LINGER`], 500 ms)
+/// at most (and the write timeout, should the answer itself stall), and
+/// the forwarder retries a refused post.
 ///
 /// # Errors
 ///
@@ -449,7 +550,36 @@ pub fn serve_conn_within(stream: TcpStream, store: &Shared<'_>, ctx: &Ctx, limit
     let mut w = &stream;
     write!(w, "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", out.status, reason(out.status))?;
     w.flush()?;
+    linger(&stream);
     Ok(out)
+}
+
+/// How long the server reads and discards after its answer. Bounded by
+/// time only: a byte cap is outrun by a fast local sender (a body a few MB
+/// over [`MAX_BODY`] arrives in milliseconds on loopback), and reading for
+/// 500 ms costs the listener the same thread-time whatever the byte count.
+const LINGER: Duration = Duration::from_millis(500);
+
+/// Ends the server's side and reads what the client still sends, for at
+/// most [`LINGER`], before the socket is closed. A socket closed with
+/// unread bytes (a body after a 413, a trickle after a 408) sends a reset,
+/// and the client loses an answer it has not read yet.
+fn linger(stream: &TcpStream) {
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    let until = Instant::now() + LINGER;
+    let mut buf = [0u8; 8 << 10];
+    let mut r = stream;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        if matches!(r.read(&mut buf), Ok(0) | Err(_)) {
+            return;
+        }
+    }
 }
 
 /// Writes one line to stderr and ignores a failure: `eprintln!` panics when
@@ -490,6 +620,8 @@ pub struct Settings {
     pub port: Option<u16>,
     /// The lane for events no item waits on.
     pub lane: Option<String>,
+    /// Logins whose reviews and comments file nothing (default none).
+    pub ignore_logins: Vec<String>,
 }
 
 impl Settings {
@@ -501,7 +633,7 @@ impl Settings {
     /// A message naming a bad key or value.
     pub fn from_config(v: Option<&Value>) -> std::result::Result<Settings, String> {
         let Some(v) = v else { return Ok(Settings::default()) };
-        let f = crate::config::Fields::new("pr_events", v, &["port", "lane"]).map_err(|e| e.to_string())?;
+        let f = crate::config::Fields::new("pr_events", v, &["port", "lane", "ignore_logins"]).map_err(|e| e.to_string())?;
         let port = f
             .uint("port")
             .map_err(|e| e.to_string())?
@@ -511,7 +643,11 @@ impl Settings {
         if let Some(l) = &lane {
             check_lane(l)?;
         }
-        Ok(Settings { port, lane })
+        let ignore_logins = f.strings("ignore_logins").map_err(|e| e.to_string())?.unwrap_or_default();
+        if let Some(bad) = ignore_logins.iter().find(|l| !is_login(l)) {
+            return Err(format!("pr_events.ignore_logins: {bad:?} is not a GitHub login"));
+        }
+        Ok(Settings { port, lane, ignore_logins })
     }
 }
 
@@ -680,10 +816,14 @@ pub fn cli(
             check_lane(&lane)?;
             let secrets = Secrets::new();
             let mut repos = Vec::new();
+            let mut hosts: Vec<Option<String>> = Vec::new();
             for spec in forwarded {
                 let Some(t) = pr_supervise::Target::parse(spec) else { continue };
                 secrets.rotate(&t.repo).map_err(|e| format!("the random source: {e}"))?;
                 repos.push(t.key());
+                if !hosts.contains(&t.host) {
+                    hosts.push(t.host);
+                }
             }
             if repos.is_empty() {
                 return Err("pr-events serve: no repository to serve (the active project's repos list names no remote)".into());
@@ -693,7 +833,30 @@ pub fn cli(
                 "atlas pr-events: listening on 127.0.0.1:{port}{PATH} for {} (secrets in memory only; unmatched events go to lane {lane}); one gh webhook forward per repository; Ctrl-C stops them and deletes the hooks they made",
                 repos.join(", ")
             ));
-            let ctx = Ctx { secrets: secrets.clone(), served: served.to_vec(), lane: lane.clone(), proofs: pr_supervise::Proofs::new() };
+            // Read once per host served: the gh user's own replies (agents
+            // commenting as that user) wake no one (#385).
+            let mut me = Vec::new();
+            for host in &hosts {
+                let on = host.as_deref().unwrap_or("github.com");
+                match gh_user(&pr_supervise::SystemGh, host.as_deref()) {
+                    Ok(login) => {
+                        say(format_args!(
+                            "atlas pr-events: comments by {login} (the gh user on {on}) are ignored; its reviews still count"
+                        ));
+                        me.push(login);
+                    }
+                    Err(e) => {
+                        say(format_args!("atlas pr-events: could not read the gh user on {on} ({e}); its own comments are not ignored"));
+                    }
+                }
+            }
+            let ctx = Ctx {
+                secrets: secrets.clone(),
+                served: served.to_vec(),
+                lane: lane.clone(),
+                proofs: pr_supervise::Proofs::new(),
+                ignore: Ignore::new(&me, &settings.ignore_logins),
+            };
             let shared: Shared<'_> = Mutex::new(store);
             supervised(&listener, &shared, &ctx, &repos, port, &lane, Arc::new(pr_supervise::SystemGh), pr_supervise::Timing::default());
             Ok(ExitCode::SUCCESS)
@@ -703,21 +866,25 @@ pub fn cli(
 }
 
 #[cfg(test)]
+#[path = "pr_listen_sender_tests.rs"]
+mod sender_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::queue;
 
-    const SECRET: &str = "placeholder-secret-for-tests";
+    pub(super) const SECRET: &str = "placeholder-secret-for-tests";
 
-    fn fixture(name: &str) -> Vec<u8> {
+    pub(super) fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/pr-events").join(name)).unwrap()
     }
 
-    fn sign(secret: &str, body: &[u8]) -> String {
+    pub(super) fn sign(secret: &str, body: &[u8]) -> String {
         format!("sha256={}", sha256::hmac(secret.as_bytes(), body).iter().map(|b| format!("{b:02x}")).collect::<String>())
     }
 
-    struct Dir(std::path::PathBuf);
+    pub(super) struct Dir(std::path::PathBuf);
 
     impl Drop for Dir {
         fn drop(&mut self) {
@@ -725,7 +892,7 @@ mod tests {
         }
     }
 
-    fn store(tag: &str) -> (Dir, MemoryStore) {
+    pub(super) fn store(tag: &str) -> (Dir, MemoryStore) {
         let d = std::env::temp_dir().join(format!("atlas-pr-listen-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -737,13 +904,13 @@ mod tests {
         vec!["octo-org/widgets".to_string()]
     }
 
-    fn ctx() -> Ctx {
+    pub(super) fn ctx() -> Ctx {
         let secrets = Secrets::new();
         secrets.set("Octo-Org/Widgets", SECRET);
-        Ctx { secrets, served: served(), lane: "pr-inbox".into(), proofs: crate::pr_supervise::Proofs::new() }
+        Ctx { secrets, served: served(), lane: "pr-inbox".into(), proofs: crate::pr_supervise::Proofs::new(), ignore: Ignore::default() }
     }
 
-    fn plan(s: &mut MemoryStore, lane: &str, after: &str) -> String {
+    pub(super) fn plan(s: &mut MemoryStore, lane: &str, after: &str) -> String {
         let mut p = queue::Planned {
             lane: lane.into(),
             kind: "builder".into(),
@@ -755,7 +922,7 @@ mod tests {
         queue::add_planned(s, &p).unwrap()
     }
 
-    fn post(event: &str, body: &[u8], sig: Option<String>) -> Request {
+    pub(super) fn post(event: &str, body: &[u8], sig: Option<String>) -> Request {
         let mut headers = vec![("x-github-event".to_string(), event.to_string()), ("content-type".into(), "application/json".into())];
         if let Some(s) = sig {
             headers.push(("x-hub-signature-256".into(), s));
@@ -813,8 +980,8 @@ mod tests {
         assert_eq!(pr_events::verdict(&r), "changes requested");
         let c = ev("review_comment_created.json", "pull_request_review_comment");
         assert_eq!((c.action, c.pr, c.author.as_str()), (Action::ReviewComment, 12, "octo-reviewer"));
-        let i = ev("issue_comment_created.json", "issue_comment");
-        assert_eq!((i.action, i.pr, i.author.as_str(), i.head.as_str()), (Action::Comment, 12, "octo-bot[bot]", ""));
+        let i = ev("issue_comment_by_builder.json", "issue_comment");
+        assert_eq!((i.action, i.pr, i.author.as_str(), i.head.as_str()), (Action::Comment, 12, "octo-builder", ""));
         let m = ev("pull_request_closed_merged.json", "pull_request");
         assert_eq!((m.action, m.pr, m.author.as_str(), m.text.as_str()), (Action::Merged, 12, "octo-maintainer", ""));
         // What does not count is ignored, not an error.
@@ -899,7 +1066,10 @@ mod tests {
     #[test]
     fn settings_read_port_and_lane() {
         let v = crate::json::parse(r#"{"port": 8765, "lane": "pr-inbox"}"#).unwrap();
-        assert_eq!(Settings::from_config(Some(&v)).unwrap(), Settings { port: Some(8765), lane: Some("pr-inbox".into()) });
+        assert_eq!(
+            Settings::from_config(Some(&v)).unwrap(),
+            Settings { port: Some(8765), lane: Some("pr-inbox".into()), ignore_logins: Vec::new() }
+        );
         for bad in [r#"{"port": 0}"#, r#"{"port": 70000}"#, r#"{"lane": "a b"}"#, r#"{"other": 1}"#] {
             assert!(Settings::from_config(Some(&crate::json::parse(bad).unwrap())).is_err(), "{bad}");
         }
@@ -1158,7 +1328,7 @@ mod tests {
         let listener = bind(0).unwrap();
         let addr = listener.local_addr().unwrap();
         let shared = Mutex::new(&mut s);
-        let (status, took) = std::thread::scope(|sc| {
+        let (status, took, sent) = std::thread::scope(|sc| {
             let client = sc.spawn(move || {
                 let mut t = TcpStream::connect_timeout(&addr, CLIENT_WAIT).unwrap();
                 let req = b"POST /github HTTP/1.1\r\nHost: x\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
@@ -1168,10 +1338,12 @@ mod tests {
                 // answer came: a write into a closed socket would reset it
                 // and lose the answer.
                 t.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+                let mut sent = 0;
                 for b in req.iter().take(40) {
                     if t.write_all(&[*b]).is_err() {
                         break;
                     }
+                    sent += 1;
                     let mut peek = [0u8; 1];
                     match t.peek(&mut peek) {
                         Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
@@ -1188,19 +1360,80 @@ mod tests {
                     }
                     got.extend_from_slice(&buf[..n]);
                 }
-                String::from_utf8_lossy(&got).split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0)
+                let status = String::from_utf8_lossy(&got).split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+                (status, sent)
             });
             let (conn, _) = listener.accept().unwrap();
             let at = Instant::now();
             let out = serve_conn_within(conn, &shared, &c, Duration::from_secs(1)).unwrap();
             let took = at.elapsed();
-            assert_eq!(client.join().unwrap(), 408);
-            (out.status, took)
+            let (answer, sent) = client.join().unwrap();
+            assert_eq!(answer, 408);
+            (out.status, took, sent)
         });
         assert_eq!(status, 408);
-        assert!(took < Duration::from_secs(3), "the deadline let the client hold the listener for {took:?}");
+        // The property is the order: the answer came while the client still
+        // had bytes to trickle, so the deadline ended the request, not the
+        // client. At a byte per >= 300 ms the 1 s deadline lets about 5
+        // through; load can raise that (a late accept or a slow server
+        // thread starts the deadline later while the client keeps sending),
+        // so the bar is 20 (6 s): load-proof, and still red for a server
+        // that ignores `limit` or stretches it 5x. The wall ceiling is a
+        // backstop at 10x the 1 s deadline.
+        assert!(sent <= 20, "the client sent {sent} bytes before the answer: no deadline cut it off in time ({took:?})");
+        assert!(took < Duration::from_secs(10), "the deadline let the client hold the listener for {took:?}");
         assert_eq!(MAX_BODY, 5 << 20);
         let read = |raw: &str| read_request(&mut BufReader::new(raw.as_bytes()));
         assert_eq!(read(&format!("POST /github HTTP/1.1\r\nContent-Length: {}\r\n\r\n", (5 << 20) + 1)).unwrap_err(), 413);
+    }
+
+    /// An answer given before the request was read in full (a 413 on the
+    /// header, a 408 at the deadline) reaches the client: closing a socket
+    /// with unread bytes sends a reset, which drops the answer the client
+    /// has not read yet, so the server ends its side and drains first.
+    #[test]
+    fn an_answer_before_the_whole_request_is_not_lost_to_a_reset() {
+        // Part of a body, more than the server's read buffer, so bytes stay
+        // unread when it answers.
+        assert_eq!(early_answer(MAX_BODY + 1, 32 << 10), 413, "the client lost the answer to a reset (32 KB sent)");
+        // A whole body 2 MB over the cap: the drain is bounded by time, not
+        // by a byte count a fast local sender outruns.
+        let big = MAX_BODY + (2 << 20);
+        assert_eq!(early_answer(big, big), 413, "the client lost the answer to a reset ({big} bytes sent)");
+    }
+
+    /// Sends a request header naming `content_length` and `body` bytes of
+    /// body in one write (two writes could be split by a descheduled client
+    /// past the server's drain), then reads the status the server answered.
+    fn early_answer(content_length: usize, body: usize) -> u16 {
+        let (_d, mut s) = store("early-answer");
+        let c = ctx();
+        let listener = bind(0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shared = Mutex::new(&mut s);
+        std::thread::scope(|sc| {
+            let client = sc.spawn(move || {
+                let mut t = TcpStream::connect_timeout(&addr, CLIENT_WAIT).unwrap();
+                let mut req = format!("POST /github HTTP/1.1\r\nHost: x\r\nContent-Length: {content_length}\r\n\r\n").into_bytes();
+                req.resize(req.len() + body, b'a');
+                // A reset fails the write; the read below then finds no answer.
+                let _ = t.write_all(&req);
+                // Read only after the server has answered and closed.
+                std::thread::sleep(Duration::from_millis(500));
+                t.set_read_timeout(Some(CLIENT_WAIT)).unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 256];
+                while let Ok(n) = t.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                String::from_utf8_lossy(&got).split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0)
+            });
+            let (conn, _) = listener.accept().unwrap();
+            assert_eq!(serve_conn_within(conn, &shared, &c, Duration::from_secs(5)).unwrap().status, 413);
+            client.join().unwrap()
+        })
     }
 }

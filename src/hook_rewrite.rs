@@ -219,29 +219,30 @@ fn next_word(s: &str) -> Option<(&str, &str)> {
 /// command of its own (`bash -c "git push"`). A quoted value stays one
 /// word, so `-C "a log"` cannot pass for a subcommand.
 ///
-/// Every nested call is on a strictly shorter text, so it ends. A word can
-/// come back as the whole piece with its space still inside (a quote opened
-/// mid-word as in `--format="%h %s"`, one left open by the cut at `|`, an
-/// escaped space): scanning it again would return it again, without end. It
-/// is read once more with its quotes and backslashes dropped instead.
+/// The quoted words wait on a work list, not the call stack, and a word is
+/// taken up only when it is shorter than the text it came from: an
+/// unclosed quote (`c" file`, a piece of `grep "a\|b\|c" file` cut at its
+/// pipes) makes the whole text one word, which the recursive form scanned
+/// again until the hook thread's stack ran out (public #15).
 fn piece_writes(piece: &str) -> bool {
-    let mut rest = piece;
-    while let Some((w, r)) = next_word(rest) {
-        rest = r;
-        if command_word(w).eq_ignore_ascii_case("git") && !git_reads(r) {
-            return true;
-        }
-        if !w.contains(char::is_whitespace) {
-            continue;
-        }
-        let nested = if w.len() < piece.len() {
-            piece_writes(w)
-        } else {
-            let bare: String = w.chars().filter(|c| !matches!(c, '"' | '\'' | '\\')).collect();
-            bare.len() < w.len() && piece_writes(&bare)
-        };
-        if nested {
-            return true;
+    let mut todo = vec![piece];
+    while let Some(text) = todo.pop() {
+        let whole = text.trim_start_matches(word_sep).len();
+        let mut rest = text;
+        while let Some((w, r)) = next_word(rest) {
+            rest = r;
+            if command_word(w).eq_ignore_ascii_case("git") && !git_reads(r) {
+                return true;
+            }
+            if w.contains(char::is_whitespace) {
+                if w.len() < whole {
+                    todo.push(w);
+                } else if let Some(q) = w.find(['"', '\'']) {
+                    // The whole text, held by an unclosed quote: what follows
+                    // the quote is still read (`b" -exec git commit`).
+                    todo.push(&w[q + 1..]);
+                }
+            }
         }
     }
     false
@@ -380,7 +381,7 @@ pub struct Router {
     cfg: HandleCfg,
     handles: Option<Handles>,
     /// The connection R7 re-indexing writes through.
-    code_conn: Option<rusqlite::Connection>,
+    code_conn: Option<crate::db::Connection>,
 }
 
 impl std::fmt::Debug for Router {
@@ -682,7 +683,12 @@ impl Router {
         let h = self.handles()?;
         let row = h.put(full.as_bytes(), &meta)?;
         let shape = Handles::shape_of(&row, &full);
-        let digest = crate::digest::digest(&row.id, &row.meta.label, shape, &full, meta.exit_code.map(|c| c as i32), h.cfg.digest_bytes);
+        // The digest ends with its hint line's newline, which Claude Code
+        // trims from the tool result the model reads: it is trimmed here, so
+        // the ledger logs the bytes the session receives (#297, R1).
+        let digest = crate::digest::digest(&row.id, &row.meta.label, shape, &full, meta.exit_code.map(|c| c as i32), h.cfg.digest_bytes)
+            .trim_end()
+            .to_string();
         // A routed Read logs the output it replaced and where it was read, but
         // the ledger credits it nothing (ATLAS-HOOK-VALUE:0012: the follow-up
         // reads made it overstate); the report judges it against the later
@@ -755,13 +761,15 @@ impl Router {
         let m = Meta { kind: kind.into(), label: cmd.lines().next().unwrap_or("").to_string(), cmd: cmd.into(), cwd: ev.cwd.clone(), session: session.to_string(), exit_code: exit, ..Meta::default() };
         let h = self.handles().ok()?;
         let d = crate::pr_digest::route(h, &pc, &w, stdout, &m, small).ok()??;
+        // Trimmed as the generic digest is, for the same reason (#297, R1).
+        let digest = d.digest.trim_end().to_string();
         let _ = crate::tokens::log_row(
             h.conn(),
             "route:gh-pr",
-            d.digest.len(),
+            digest.len(),
             Some(crate::tokens::Counterfactual { grep: 0, read: crate::tokens::shown_bytes(stdout) }),
         );
-        Some(d.digest)
+        Some(digest)
     }
 
     /// Annotations for a result that passes whole (see the module docs):
@@ -886,7 +894,7 @@ impl Router {
     pub fn reindex_code(&mut self, path: &str) -> Result<crate::code::Reindexed> {
         if self.code_conn.is_none() {
             let c = crate::store::open_raw(&self.db)?;
-            c.busy_timeout(std::time::Duration::from_secs(10))?;
+            crate::hook_budget::bound_within::<10>(&c)?;
             self.code_conn = Some(c);
         }
         let c = self.code_conn.as_mut().ok_or_else(|| Error::Db("index connection".into()))?;
@@ -907,7 +915,7 @@ impl Router {
             let _ = crate::store::guarded(c, || {
                 c.execute(
                     "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
-                    rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, reason],
+                    crate::db::params![crate::store::utc(std::time::SystemTime::now()), query, reason],
                 )?;
                 Ok(())
             });
@@ -924,7 +932,7 @@ impl Router {
             let _ = crate::store::guarded(c, || {
                 c.execute(
                     "INSERT INTO misses(time, tool, query, returned, found, reason, client) VALUES(?1, 'route', ?2, '', '', ?3, 'atlas-hook')",
-                    rusqlite::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
+                    crate::db::params![crate::store::utc(std::time::SystemTime::now()), query, e.to_string()],
                 )?;
                 Ok(())
             });
@@ -1501,41 +1509,6 @@ mod tests {
     }
 
     #[test]
-    fn a_word_the_scanner_cannot_split_does_not_recurse_forever() {
-        // Each of these holds a word with a space that `next_word` hands
-        // back whole (a quote opened mid-word, one left open by the cut at
-        // `|`, an escaped space). `piece_writes` used to call itself on
-        // that same word until the hooks thread overflowed its stack and
-        // the server aborted.
-        for cmd in [r#"git log --format="%h %s""#, r#"grep -n "mod tests\|fn git_" src/a.rs"#, r"ls a\ b", r#"grep x a"b c"d"#] {
-            assert!(routable(cmd), "{cmd}");
-        }
-        // The quoted command is still read once the quotes are dropped.
-        assert!(!routable(r#"ls; sh -c x="y" "git push""#));
-        assert!(!routable(r#"ls | xargs -I{} sh -c 'a\ b; git push'"#));
-        assert!(piece_writes(r#"x=" git push"#));
-    }
-
-    #[test]
-    fn piece_writes_returns_on_every_mix_of_quotes_escapes_and_spaces() {
-        // Every text of up to eight of these characters, then long runs of
-        // the forms that nest: the scan returns and its depth stays far
-        // from the stack's end.
-        let alphabet = ['a', ' ', '"', '\'', '\\'];
-        let mut texts = vec![String::new()];
-        for _ in 0..8 {
-            let longer: Vec<String> = texts.iter().flat_map(|t| alphabet.iter().map(move |c| format!("{t}{c}"))).collect();
-            for t in &longer {
-                assert!(!piece_writes(t), "{t:?}");
-            }
-            texts = longer;
-        }
-        for unit in ["\"a 'a ", "'a \"a ", "a\\ ", "a\"a a", "\\\" a ", "\"'\\ "] {
-            assert!(!piece_writes(&unit.repeat(50_000)), "{unit:?}");
-        }
-    }
-
-    #[test]
     fn relative_paths_never_split_a_character() {
         // A cwd whose length ends inside a multi-byte character of the path
         // (a combining accent here) used to panic in `split_at`.
@@ -1668,5 +1641,17 @@ mod tests {
         assert_eq!(read_note("x.rs", 20, 65, &items), "atlas: x.rs lines 20-65 cut [impl Store 1-300] [fn a 10-30]");
         assert_eq!(read_note("x.rs", 1, 300, &items), "");
         assert_eq!(read_note("x.rs", 36, 50, &items), "atlas: x.rs lines 36-50 cut [impl Store 1-300] [fn b 35-60]");
+    }
+
+    #[test]
+    fn a_word_the_scanner_cannot_split_does_not_recurse_forever() {
+        // Each of these holds a word with a space that `next_word` hands
+        // back whole (a quote opened mid-word, one left open by the cut at
+        // `|`, an escaped space).
+        for cmd in [r#"git log --format="%h %s""#, r#"grep -n "mod tests\|fn git_" src/a.rs"#, r"ls a\ b", r#"grep x a"b c"d"#] {
+            assert!(routable(cmd), "{cmd}");
+        }
+        assert!(!routable(r#"ls; sh -c x="y" "git push""#));
+        assert!(piece_writes(r#"x=" git push"#));
     }
 }

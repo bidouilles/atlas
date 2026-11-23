@@ -4,7 +4,7 @@ One Rust binary, one dependency (SQLite, bundled), no network at query time.
 
 ## Processes
 
-- **The MCP server** (`atlas`, started by Claude Code from `.mcp.json`). It serves the tools over
+- **The MCP server** (`atlas`, started by Claude Code from `plugin.json`'s `mcpServers`). It serves the tools over
   stdio. It answers `hook` calls on their own worker thread, so a hook never waits behind a slow tool call.
   It keeps its own log, `atlas-server.log` in the folder of the database it opened (`src/serve_log.rs`),
   meant to be attached to a bug report. It is safe to attach to a public GitHub issue, and its first line
@@ -62,8 +62,9 @@ only bumps it. The table is a ledger: triggers refuse a delete and any change bu
 stamps, each set once from NULL and never cleared. `removed_at` means the folder is gone (NULL while it
 exists); `ended_at` means another lane took the worktree over while it still exists. A row is open while
 both stamps are NULL, and that one predicate is used by the partial unique index (one open row per path),
-the handover, `atlas worktrees list` and the removal code that will read the ledger. Nothing in atlas
-removes a worktree from it. Opening a store at version 2 copies it to `memory.sqlite.v2.bak` with
+the handover, `atlas worktrees list` and worktree gc (`src/worktree_gc.rs`), which removes only open-row
+worktrees that are stale and hold no work, with `git worktree remove` and never `--force`, and stamps their rows
+removed; rows themselves are never deleted. Opening a store at version 2 copies it to `memory.sqlite.v2.bak` with
 `VACUUM INTO` under the write lock, then adds the table in the same transaction as the version bump, so a
 crash leaves the v2 store; an atlas built for version 2 refuses a store at 3.
 

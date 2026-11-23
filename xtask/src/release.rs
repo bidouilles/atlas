@@ -531,6 +531,20 @@ pub(crate) fn leak_check(tree: &Path, denylist: &Path) -> R<(usize, usize, Vec<S
     Ok((m.len(), named.len(), m.hits(&named)))
 }
 
+/// The hidden-character gate (`cargo xtask hidden`) over an exported
+/// tree, with the workspace's allowlist; an entry for a file the export
+/// leaves out is not an error here (the tracked-tree gate checks those).
+pub(crate) fn hidden_gate(tree: &Path, root: &Path) -> R<String> {
+    let mut files = Vec::new();
+    files_under(tree, Path::new(""), &mut files)?;
+    files.sort_by_key(|s| collate_key(s));
+    let named: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|f| std::fs::read(tree.join(&f)).map(|b| (f.clone(), b)).map_err(|e| format!("{f}: {e}")))
+        .collect::<R<_>>()?;
+    crate::hidden::gate(&named, &crate::hidden::allowlist(root)?, false, "the exported tree")
+}
+
 /// The public repository when ATLAS_PUBLIC_REPO is not set. The README's
 /// wiki links name it (tests/docs.rs checks they agree).
 pub const DEFAULT_PUBLIC_REPO: &str = "bloodfeast/atlas";
@@ -728,9 +742,25 @@ pub(crate) fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
         let _ = std::fs::remove_file(&pub_der);
         e
     };
-    // openssl asks for the passphrase on the terminal: stdin is inherited.
-    let ok = Command::new(&openssl).args(["pkey", "-pubout", "-outform", "DER", "-in"]).arg(key).arg("-out").arg(&pub_der).status();
-    if !ok.map(|s| s.success()).unwrap_or(false) {
+    // With an armed passphrase store (ship and sign on Windows), openssl
+    // reads the passphrase from its standard input (`-passin stdin`), never
+    // from an argument or the environment; else it asks on the terminal,
+    // stdin inherited.
+    let pass = match crate::passphrase::armed() {
+        Some(store) => Some(crate::passphrase::load(store).map_err(cleanup)?),
+        None => None,
+    };
+    let run = |c: &mut Command| -> bool {
+        match &pass {
+            Some(p) => {
+                c.args(["-passin", "stdin"]);
+                crate::passphrase::run_with(c, p).unwrap_or(false)
+            }
+            None => c.status().map(|s| s.success()).unwrap_or(false),
+        }
+    };
+    let ok = run(Command::new(&openssl).args(["pkey", "-pubout", "-outform", "DER", "-in"]).arg(key).arg("-out").arg(&pub_der));
+    if !ok {
         return Err(cleanup("cannot read the signing key".into()));
     }
     let der = std::fs::read(&pub_der).map_err(|e| cleanup(e.to_string()))?;
@@ -738,15 +768,8 @@ pub(crate) fn sign_manifest(key: &Path, trusted: &str, manifest: &Path) -> R {
     if key_hex != trusted {
         return Err(cleanup(format!("ATLAS_SIGN_KEY is not the key built into atlas (its public half is {key_hex})")));
     }
-    let ok = Command::new(&openssl)
-        .args(["pkeyutl", "-sign", "-rawin", "-inkey"])
-        .arg(key)
-        .arg("-in")
-        .arg(manifest)
-        .arg("-out")
-        .arg(&sig)
-        .status();
-    if !ok.map(|s| s.success()).unwrap_or(false) {
+    let ok = run(Command::new(&openssl).args(["pkeyutl", "-sign", "-rawin", "-inkey"]).arg(key).arg("-in").arg(manifest).arg("-out").arg(&sig));
+    if !ok {
         return Err(cleanup("signing failed".into()));
     }
     if size_of(&sig).map_err(cleanup)? != 64 {
@@ -1081,6 +1104,8 @@ pub fn run(args: Vec<String>) -> R {
     }
     say(&format!("leak check: {n} terms, {nfiles} files, no hits"));
     crate::release_ci::secret_gate(&tree.join("bin"), "the release binaries")?;
+    say("context poisoning guard: hidden text (every exported text file; binaries are skipped)");
+    say(&hidden_gate(&tree, &root)?);
 
     say("notes");
     let binaries = binaries_table(&stage.join("bin"))?;
@@ -1312,8 +1337,10 @@ pub(crate) struct ManifestNotes {
     pub(crate) plugin_changed_in: Option<String>,
 }
 
-/// The paths whose files only Claude Code's `/plugin` update installs.
-pub(crate) const PLUGIN_PATHS: &[&str] = &[".claude-plugin", ".mcp.json", "hooks", "skills"];
+/// The paths whose files only Claude Code's `/plugin` update installs. The
+/// MCP server's entry is inline in `.claude-plugin/plugin.json`: a root
+/// `.mcp.json` would also be read as a project server in this repository.
+pub(crate) const PLUGIN_PATHS: &[&str] = &[".claude-plugin", "hooks", "skills"];
 
 /// The manifest's `highlights`: the items of the section's Highlights (see
 /// `notes_parts`), one line each, at most `atlas::update::HIGHLIGHTS_MAX`

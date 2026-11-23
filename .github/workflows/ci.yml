@@ -1,8 +1,14 @@
-# The public repository's checks: the whole workspace's tests, in release,
-# on Linux, Windows and macOS. No secrets and a read-only token. Tests that
-# need something outside the repository (the private leak denylist, a real
-# configuration, the embedding model) skip themselves when it is absent, as
-# they do on any machine without it.
+# The public repository's checks: the whole workspace's tests on Linux,
+# Windows and macOS, and clippy. No secrets and a read-only token. Tests
+# that need something outside the repository (the private leak denylist, a
+# real configuration, the embedding model) skip themselves when it is
+# absent, as they do on any machine without it.
+#
+# Built for wall time, on GitHub's own actions only: compiled dependencies
+# come from a cache that only a push to main saves (a pull request, a fork's
+# too, restores main's and saves nothing), the tests run on cargo-nextest
+# with no fail-fast so one run reports every failing test, and Windows
+# builds and runs on a Dev Drive.
 name: ci
 
 on:
@@ -28,17 +34,102 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      # Nothing is rebuilt in place, so incremental state is only cost.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Windows: the workspace (so target/) and the temporary directory on a
+      # ReFS Dev Drive with antivirus filters kept off it; the tests
+      # write many small files and start many processes. Inline rather than
+      # an action: the public repository runs only GitHub's own actions.
+      - name: Dev Drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vhd = Join-Path $env:RUNNER_TEMP 'dev_drive.vhdx'
+          $part = New-VHD -Path $vhd -SizeBytes 16GB -Dynamic | Mount-VHD -PassThru | Initialize-Disk -PassThru | New-Partition -AssignDriveLetter -UseMaximumSize
+          $part | Format-Volume -DevDrive -Confirm:$false -Force | Out-Null
+          $drive = "$($part.DriveLetter):"
+          fsutil devdrv enable /disallowAv; if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          fsutil devdrv clearFiltersAllowed $drive; if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          fsutil devdrv trust /f $drive; if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $ws = Join-Path "$drive\" (Split-Path -Leaf $env:GITHUB_WORKSPACE)
+          Copy-Item -Recurse -Force -Path $env:GITHUB_WORKSPACE -Destination $ws
+          $tmp = Join-Path "$drive\" 'tmp'
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          "DEV_DRIVE_WORKSPACE=$ws" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TMP=$tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TEMP=$tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       # rust-toolchain.toml names the toolchain; rustup installs it on the
-      # first cargo call.
-      - name: Test
-        run: cargo test --workspace --release --locked
+      # first cargo call. The cache holds the registry and the target folder,
+      # keyed on the job, the runner, Cargo.lock, the Cargo.toml files and
+      # rust-toolchain.toml. Every run restores; only a push to main saves.
+      - name: Restore the dependency cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}/target
+          key: ${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
+      # A prebuilt nextest, its sha256 pinned here (the release's own .sha256
+      # files agree); never built from source.
+      - name: Install cargo-nextest
+        shell: bash
         env:
-          CARGO_TERM_COLOR: always
-          CARGO_BUILD_JOBS: 4
+          NEXTEST: "0.9.118"
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   t=x86_64-unknown-linux-gnu; h=1e60aac5de62391d2419bb6c5bfa467f4b27586b3f1b3ec07aa79f4632583450 ;;
+            Windows) t=x86_64-pc-windows-msvc;   h=95d077375d07efc72b4cea1e633a0bb940fbda18fbf200e08714466eae89e62d ;;
+            macOS)   t=universal-apple-darwin;   h=792f4677422c025b0dfa204ea58c6406c55e62f6b5b774c3ee33ac7ee46a0b69 ;;
+          esac
+          # Relative names: GNU tar on Windows reads a drive letter as a host.
+          cd "$RUNNER_TEMP"
+          f="cargo-nextest-$NEXTEST-$t.tar.gz"
+          curl -sSfL --proto '=https' --tlsv1.2 -o "$f" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST/$f"
+          if command -v sha256sum >/dev/null; then got=$(sha256sum "$f" | cut -d' ' -f1); else got=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+          [ "$got" = "$h" ] || { echo "cargo-nextest checksum mismatch: $got"; exit 1; }
+          mkdir -p nextest && tar -xzf "$f" -C nextest
+          mkdir -p "$HOME/.cargo/bin" && mv nextest/cargo-nextest* "$HOME/.cargo/bin/"
+      - name: Test
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
+        # The ci profile (Cargo.toml): a debug build, no debug information,
+        # dependencies optimised. Every failure is reported, and listed
+        # again at the end of the run.
+        run: cargo nextest run --workspace --cargo-profile ci --locked --no-fail-fast --failure-output immediate-final
+      # nextest does not run doc tests.
+      - name: Doc tests
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}
+        run: cargo test --workspace --profile ci --locked --doc
+      - name: Save the dependency cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ${{ env.DEV_DRIVE_WORKSPACE || github.workspace }}/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      # No tracked file may hold a character a reviewer cannot see
+      # (xtask/src/hidden.rs; deliberate cases in xtask/hidden-allow.txt).
+      # The xtask unit test the_tracked_tree_passes_the_gate already runs it
+      # inside Test; this step gives the finding its own line in the run.
+      # In the same profile as Test, so it reuses its graph and links only
+      # xtask.
+      - name: Context poisoning guard (hidden text)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        run: cargo run --profile ci --locked --quiet --package xtask -- hidden
   clippy:
     # Same rule as the tests. On a pinned toolchain, so a new Rust release's
     # lints cannot fail an unrelated release: bump it in xtask/src/release.rs
@@ -50,19 +141,39 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install the pinned clippy
         run: rustup toolchain install 1.99.0 --profile minimal -c clippy
+      # As the test job's: restored always, saved from main only.
+      - name: Restore the dependency cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ github.job }}-${{ runner.os }}-${{ runner.arch }}-
       - name: Clippy, all targets with dev
         run: cargo +1.99.0 clippy --workspace --locked --all-targets --features atlas/dev -- -D warnings
-        env:
-          CARGO_TERM_COLOR: always
-          CARGO_BUILD_JOBS: 4
       - name: Clippy, default targets
+        if: ${{ !cancelled() }}
         run: cargo +1.99.0 clippy --workspace --locked -- -D warnings
-        env:
-          CARGO_TERM_COLOR: always
-          CARGO_BUILD_JOBS: 4
+      - name: Save the dependency cache
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}

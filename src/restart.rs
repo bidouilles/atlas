@@ -53,9 +53,6 @@ const LIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
 pub const REFRESH_EVERY: Duration = Duration::from_secs(180);
 /// The runq state file version this reads; any other is skipped.
 const RUNQ_STATE: &str = "runq-state 1";
-/// runq's own default root on Windows, used when neither `RUNQ_ROOT` nor
-/// `orchestrate.runq_root` names one.
-pub const RUNQ_DEFAULT_ROOT: &str = "Z:/scratch/gpulock/state";
 /// The lock file beside the store that one session start holds while it
 /// reads and files the crash case, so two starts at once offer it once.
 pub const OFFER_LOCK: &str = "restart-offer.lock";
@@ -73,6 +70,59 @@ pub fn server_tag() -> String {
         Some(t) => format!("{pid} {t}"),
         None => format!("{pid} -"),
     }
+}
+
+/// The Claude Code process that runs this server's session, as a launch
+/// entry's `owner:` line (#389), tagged as [`server_tag`] tags (`<pid>
+/// <start>`): [`owner_pid`] on this machine's process table. `None` when no
+/// ancestor is provably Claude Code; the line is then left out, and no
+/// slot is ever released on owner evidence.
+pub fn owner_tag() -> Option<String> {
+    let pid = owner_pid(&crate::platform::process::table(), std::process::id())?;
+    Some(match crate::platform::process::start_time(pid) {
+        Some(t) => format!("{pid} {t}"),
+        None => format!("{pid} -"),
+    })
+}
+
+/// The shells and launchers [`owner_pid`] walks past between the server
+/// and Claude Code (`cmd /c`, a non-exec `sh -c`, the MSYS bash stub, an
+/// atlas shim), by executable name without `.exe`.
+const WRAPPERS: &[&str] = &["atlas", "bash", "cmd", "dash", "env", "fish", "ksh", "nice", "nohup", "powershell", "pwsh", "sh", "zsh"];
+
+/// The executable names Claude Code runs as: its own binary, or the
+/// JavaScript runtime it ships on.
+const CLAUDE_CODE: &[&str] = &["bun", "claude", "node"];
+
+/// The Claude Code process above `me` in `procs` ((pid, parent pid,
+/// executable name), [`owner_tag`], #389 review S2): the first ancestor
+/// that is not a known shell or launcher ([`WRAPPERS`]), and only when its
+/// name is Claude Code's ([`CLAUDE_CODE`]). `None` for anything else (an
+/// unknown parent, init, a pid namespace's edge, a loop, an unread table):
+/// a slot is released on owner evidence only when the owner is known.
+pub fn owner_pid(procs: &[(u32, u32, String)], me: u32) -> Option<u32> {
+    let name = |n: &str| {
+        let n = n.rsplit(['/', '\\']).next().unwrap_or(n);
+        let n = if n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(".exe") { &n[..n.len() - 4] } else { n };
+        n.to_ascii_lowercase()
+    };
+    let parent_of = |pid: u32| procs.iter().find(|p| p.0 == pid).map(|p| p.1);
+    let mut pid = parent_of(me)?;
+    // A short walk: a wrapper chain is a few deep; a loop is cut off.
+    for _ in 0..8 {
+        if pid <= 1 {
+            return None;
+        }
+        let n = name(&procs.iter().find(|p| p.0 == pid)?.2);
+        if CLAUDE_CODE.contains(&n.as_str()) {
+            return Some(pid);
+        }
+        if !WRAPPERS.contains(&n.as_str()) {
+            return None;
+        }
+        pid = parent_of(pid)?;
+    }
+    None
 }
 
 /// Whether the server `tag` ([`server_tag`]) names still runs: its pid is
@@ -288,8 +338,8 @@ pub fn wait_prepared(timeout: Duration, pred: impl FnMut(Option<&[u8]>) -> bool)
 /// The runq root a test set ([`set_runq_root`]).
 static RUNQ_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
-/// Points the runq read at `root` instead of `RUNQ_ROOT` or runq's default
-/// (tests).
+/// Points the runq read at `root` instead of `RUNQ_ROOT` or the
+/// configured root (tests).
 #[doc(hidden)]
 pub fn set_runq_root(root: PathBuf) {
     *RUNQ_ROOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(root);
@@ -344,13 +394,18 @@ pub fn runq_holders_at(root: &Path) -> Vec<String> {
 
 /// The runq root the holders are read from: the root a test set, else the
 /// `RUNQ_ROOT` environment variable (as runq itself reads it), else
-/// `configured` (`orchestrate.runq_root`), else runq's default
-/// [`RUNQ_DEFAULT_ROOT`] on Windows; elsewhere none (no holders are read).
+/// `configured` (`orchestrate.runq_root`); with neither set, none (no
+/// holders are read).
 pub fn runq_root(configured: Option<&Path>) -> Option<PathBuf> {
     let set = RUNQ_ROOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    set.or_else(|| std::env::var_os("RUNQ_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from))
-        .or_else(|| configured.map(Path::to_path_buf))
-        .or_else(|| cfg!(windows).then(|| PathBuf::from(RUNQ_DEFAULT_ROOT)))
+    let env = std::env::var_os("RUNQ_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from);
+    runq_root_from(set, env, configured)
+}
+
+/// [`runq_root`]'s order over its inputs: the test root, the environment's
+/// `RUNQ_ROOT`, then `configured`. No root is built in.
+fn runq_root_from(set: Option<PathBuf>, env: Option<PathBuf>, configured: Option<&Path>) -> Option<PathBuf> {
+    set.or(env).or_else(|| configured.map(Path::to_path_buf))
 }
 
 /// The runq holders now, from [`runq_root`]. Read in the [`Refresher`]
@@ -425,6 +480,12 @@ impl Refresher {
 /// `YYYY-MM-DDTHH:MM:SSZ` for `t`.
 fn utc(t: SystemTime) -> String {
     crate::discussion::civil(t.duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)))
+}
+
+/// The oldest launch entry time the crash case and the restart point read
+/// ([`CRASH_WINDOW`] before `now`), in the store's time form.
+pub fn crash_floor(now: SystemTime) -> String {
+    utc_ms(now.checked_sub(CRASH_WINDOW).unwrap_or(UNIX_EPOCH))
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.000Z` for `t`: the form of the store's times, so
@@ -639,6 +700,23 @@ fn claim_points(store: &Path, now: SystemTime, boot: Option<SystemTime>) -> Vec<
     out
 }
 
+/// The agents named by the point files beside `store` whose server still
+/// runs (the ones [`claim_points`] leaves): a live server lists them, so
+/// they run on even when the server that filed their launch is gone (#306
+/// M1: an MCP server restart under a waiting agent).
+fn live_point_agents(store: &Path) -> HashSet<String> {
+    let Some(dir) = store.parent() else { return HashSet::new() };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(POINT_PREFIX) && n.ends_with(".json")))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok().as_deref().and_then(Point::parse))
+        .filter(|p| !p.server.is_empty() && server_live(&p.server) == Some(true))
+        .flat_map(|p| p.agents.into_iter().map(|a| a.id))
+        .collect()
+}
+
 /// Whether the machine booted (at `boot`, when known) after `written`: a
 /// point written then is from a machine that went down since.
 pub fn booted_since(written: SystemTime, boot: Option<SystemTime>) -> bool {
@@ -721,6 +799,13 @@ pub fn offer_at(store: &mut MemoryStore, session: &str, now: SystemTime, boot: O
         }
     }
     let from_points = open.len();
+    // An agent a live server's point lists runs on: never a crash, even
+    // when the server that filed its launch is gone (#306 M1). The limit:
+    // a server lists an agent only after it has handled an event of that
+    // agent's session, so a server restarted under an idle parent that has
+    // sent it no event yet lists none, and a resume in a second terminal
+    // can still offer a quiet waiter as dead.
+    covered.extend(live_point_agents(store.path()));
     // The crash case, read before this start files its own record.
     let crashed = match crash_agents(store, session, now, &released, &mut covered) {
         Ok(a) => a,
@@ -776,8 +861,10 @@ pub fn offer_at(store: &mut MemoryStore, session: &str, now: SystemTime, boot: O
 }
 
 /// The crash case's agents: the active `launch` entries of the last
-/// [`CRASH_WINDOW`], of every session other than `session`, whose agent is
-/// not in `covered` (which they join), did not finish and is not running:
+/// [`CRASH_WINDOW`], of every session other than `session` (and of
+/// `session` itself when the server that filed them is gone: a resume),
+/// whose agent is not in `covered` (which they join), did not finish and is
+/// not running:
 /// - the server that filed the entry (its `server:` line, pid and start
 ///   time) still runs, so its session does too: not offered;
 /// - a restart record already offered the agent (`offered:`, `agents:`):
@@ -804,16 +891,19 @@ fn crash_agents(
             *e = (*e).max(at);
         }
     }
-    let floor = utc_ms(now.checked_sub(CRASH_WINDOW).unwrap_or(UNIX_EPOCH));
     let live_after = now.checked_sub(LIVE_WINDOW).unwrap_or(UNIX_EPOCH);
     let mut out = Vec::new();
-    for h in store.active_entries_no_body(crate::hooks::LAUNCH_ENTRY)?.into_iter().filter(|h| h.time > floor) {
+    for h in store.active_entries_since_no_body(crate::hooks::LAUNCH_ENTRY, &crash_floor(now))? {
         let s = front_value(&h.meta, "session").unwrap_or("");
         let id = front_value(&h.meta, "agent").unwrap_or("").to_string();
-        if s.is_empty() || s == session || id.is_empty() || !covered.insert(id.clone()) {
+        // The asking session's own entries count only once the server that
+        // filed them is gone: a resume of the same session in a new process,
+        // whose agents died with the old one (#306 H2).
+        let live = front_value(&h.meta, "server").and_then(server_live);
+        if s.is_empty() || (s == session && live != Some(false)) || id.is_empty() || !covered.insert(id.clone()) {
             continue;
         }
-        if front_value(&h.meta, "server").and_then(server_live) == Some(true) {
+        if live == Some(true) {
             continue;
         }
         let description = front_value(&h.meta, "description").unwrap_or("").to_string();
@@ -992,9 +1082,23 @@ mod tests {
 
     /// The catch, as the console handler and the signal thread call it:
     /// with agents running it writes the point; with none it writes nothing.
-    /// One test, since the catch's slot is process-wide.
+    /// One test, since the catch's slot is process-wide; and run alone in a
+    /// child of this test binary, since other tests here run servers that
+    /// set that slot, the stdin state and the pending hold in parallel.
     #[test]
     fn the_catch_writes_the_running_agents_and_nothing_without_them() {
+        if std::env::var_os("ATLAS_CATCH_ALONE").is_none() {
+            let _serial = catch_serial();
+            let o = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "restart::tests::the_catch_writes_the_running_agents_and_nothing_without_them", "--nocapture", "--test-threads", "1"])
+                .env("ATLAS_CATCH_ALONE", "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let out = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+            assert!(o.status.success() && out.contains("1 passed"), "{out}");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("atlas-catch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = dir.join("memory.sqlite");
@@ -1155,6 +1259,13 @@ mod tests {
         std::process::exit(0);
     }
 
+    /// One catch test at a time: each runs its catch in a child of this
+    /// binary, and children run apart from the parallel tests here.
+    fn catch_serial() -> std::sync::MutexGuard<'static, ()> {
+        static CATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        CATCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The point files in `dir` (a helper child names its own).
     fn points_in(dir: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -1206,6 +1317,7 @@ mod tests {
     /// writes no restart point, though agents run.
     #[test]
     fn a_closed_stdin_exit_writes_nothing() {
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-eof-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (mut c, _out) = helper(&dir, false);
@@ -1225,6 +1337,7 @@ mod tests {
     /// does.
     #[test]
     fn a_closed_stdin_with_a_restart_pending_marks_the_point_ended() {
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-ended-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1290,6 +1403,7 @@ mod tests {
     #[test]
     fn sigterm_writes_the_point_and_still_ends_the_process() {
         use std::os::unix::process::ExitStatusExt;
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-term-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (mut c, _out) = helper(&dir, false);
@@ -1317,6 +1431,7 @@ mod tests {
     fn a_shutdown_signal_with_the_end_of_input_still_writes_the_point() {
         use std::io::BufRead;
         use std::os::unix::process::ExitStatusExt;
+        let _serial = catch_serial();
         let dir = std::env::temp_dir().join(format!("atlas-catch-both-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (mut c, mut out) = helper(&dir, true);
@@ -1334,5 +1449,16 @@ mod tests {
         assert_eq!(st.signal(), Some(15), "{st:?}");
         assert_eq!(points_in(&dir).len(), 1, "{logged}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With neither `RUNQ_ROOT` nor `orchestrate.runq_root` set there is no
+    /// runq root, so no holder file is read: no machine's path is built in.
+    #[test]
+    fn no_runq_root_without_env_or_config() {
+        assert_eq!(runq_root_from(None, None, None), None);
+        let c = PathBuf::from("/cfg/runq");
+        assert_eq!(runq_root_from(None, None, Some(&c)), Some(c.clone()));
+        let e = PathBuf::from("/env/runq");
+        assert_eq!(runq_root_from(None, Some(e.clone()), Some(&c)), Some(e));
     }
 }
